@@ -46,6 +46,14 @@ typedef struct streamFilter {
     sds *fields;
     size_t alloc_size;  /* Usable bytes of every allocation the filter owns,
                            charged to the stream's alloc_size. */
+    /* Where the fields sit among the master fields of one listpack node, for
+     * the node's entries flagged SAMEFIELDS. Filled by t_stream.c, which
+     * keys it on the node and on the read in progress; never persisted. */
+    const unsigned char *pos_lp;
+    unsigned long long pos_read;
+    int pos_count;      /* Fields the node's master entry has. */
+    int *pos_field;     /* Index into 'fields' of each, in master field order. */
+    int64_t *pos_index; /* Their positions among the master fields, ascending. */
 } streamFilter;
 
 /* Parse 'len' bytes at 'src'. On error returns NULL and sets '*err' to a new

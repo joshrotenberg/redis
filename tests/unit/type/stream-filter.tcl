@@ -209,6 +209,75 @@ start_server {
         assert_equal {1} [filter_matching {a = 1} {{a 1 a 2}}]
     }
 
+    test {Filters read values by field position, node by node} {
+        r DEL s
+        set node_max [lindex [r CONFIG GET stream-node-max-entries] 1]
+        r CONFIG SET stream-node-max-entries 3
+        # Node 1 lists a, b; node 2 lists b, a; node 3 has no b. An entry
+        # whose fields differ from its node's first entry (1-2, 1-6) carries
+        # its own field names.
+        r XADD s 1-1 a 1 b 2
+        r XADD s 1-2 b 4 a 3
+        r XADD s 1-3 a 5 b 6
+        r XADD s 1-4 b 7 a 8
+        r XADD s 1-5 b 9 a 10
+        r XADD s 1-6 a 11
+        r XADD s 1-7 a 12 c 13
+        r XADD s 1-8 a 14 c 15
+        set out {}
+        foreach {name filter} {
+            g1 {a >= 3 AND a <= 10}
+            g2 {b = 9}
+            g3 {a = 11}
+            g4 {b NOT EXISTS}
+            g5 {c = 15 AND a = 14}
+        } {
+            r XGROUP CREATE s $name 0 FILTER $filter
+            lappend out [filter_ids [r XREADGROUP GROUP $name c STREAMS s >]]
+        }
+        r CONFIG SET stream-node-max-entries $node_max
+        assert_equal {{1-2 1-3 1-4 1-5} 1-5 1-6 {1-6 1-7 1-8} 1-8} $out
+    }
+
+    test {Filters read the first of a node's repeated field names} {
+        r DEL s
+        r XADD s 1-1 a 1 a 2
+        r XADD s 1-2 a 3 a 4
+        r XGROUP CREATE s g1 0 FILTER {a = 3}
+        r XGROUP CREATE s g2 0 FILTER {a = 4}
+        assert_equal {1-2} [filter_ids [r XREADGROUP GROUP g1 c STREAMS s >]]
+        assert_equal {} [filter_ids [r XREADGROUP GROUP g2 c STREAMS s >]]
+    }
+
+    test {A filter that names more than 16 fields} {
+        r DEL s
+        set fields {}
+        set clauses {}
+        for {set j 1} {$j <= 17} {incr j} {
+            lappend fields f$j $j
+            lappend clauses "f$j = $j"
+        }
+        r XADD s 1-1 {*}$fields
+        r XADD s 1-2 {*}$fields
+        lset fields end 0
+        r XADD s 1-3 {*}$fields
+        r XGROUP CREATE s g 0 FILTER [join $clauses " AND "]
+        assert_equal {1-1 1-2} [filter_ids [r XREADGROUP GROUP g c STREAMS s >]]
+    }
+
+    test {A filter's field positions are not reused for a new node} {
+        r DEL s
+        r XGROUP CREATE s g $ MKSTREAM FILTER {a = 2}
+        r XADD s 1-1 a 2 b 1
+        assert_equal {1-1} [filter_ids [r XREADGROUP GROUP g c STREAMS s >]]
+        # Free the node, then add one of the same size with the fields
+        # swapped: the allocator may hand back the same address.
+        r XTRIM s MAXLEN 0
+        r XADD s 1-2 b 2 a 1
+        r XADD s 1-3 b 1 a 2
+        assert_equal {1-3} [filter_ids [r XREADGROUP GROUP g c STREAMS s >]]
+    }
+
     test {COPY carries a group's filter} {
         filter_ticks
         r XGROUP CREATE ticks fx 0 FILTER {type = fx} MAXSCAN 50

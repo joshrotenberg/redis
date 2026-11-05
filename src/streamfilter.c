@@ -670,6 +670,8 @@ static void sfComputeAllocSize(streamFilter *f) {
     if (f->fields) size += zmalloc_usable_size(f->fields);
     for (int j = 0; j < f->nfields; j++) size += sdsAllocSize(f->fields[j]);
     if (f->root) size += sfNodeAllocSize(f->root);
+    if (f->pos_field) size += zmalloc_usable_size(f->pos_field);
+    if (f->pos_index) size += zmalloc_usable_size(f->pos_index);
     f->alloc_size = size;
 }
 
@@ -705,6 +707,10 @@ streamFilter *streamFilterParse(const char *src, size_t len, sds *err) {
         return NULL;
     }
     f->source = sdsnewlen(src, len);
+    if (f->nfields) {
+        f->pos_field = zmalloc(sizeof(*f->pos_field) * f->nfields);
+        f->pos_index = zmalloc(sizeof(*f->pos_index) * f->nfields);
+    }
     sfComputeAllocSize(f);
     return f;
 }
@@ -730,6 +736,8 @@ void streamFilterFree(streamFilter *f) {
     sfNodeFree(f->root);
     for (int j = 0; j < f->nfields; j++) sdsfree(f->fields[j]);
     zfree(f->fields);
+    zfree(f->pos_field);
+    zfree(f->pos_index);
     sdsfree(f->source);
     zfree(f);
 }

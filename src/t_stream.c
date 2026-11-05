@@ -2320,6 +2320,48 @@ static inline int streamReplyMaxsizeReached(client *c, long long maxsize, size_t
 
 #define STREAM_FILTER_STACK_FIELDS 16
 
+/* Counts the reads that evaluate filters. A filter's node positions
+ * (streamFilter.pos_*) are used only during the read that computed them, for
+ * the node they were computed for: no node is freed or reallocated while a
+ * read runs, so the node's address cannot be reused by another. */
+static unsigned long long streamFilterReads = 0;
+
+/* Find where the filter's fields sit among the master fields of the node the
+ * iterator is in, unless already known for this node and read. Entries
+ * flagged SAMEFIELDS list only values, in master field order, so their
+ * values can then be read by position without reading any field name. */
+static void streamFilterNodePositions(streamFilter *f, streamIterator *si) {
+    if (f->pos_lp == si->lp && f->pos_read == streamFilterReads) return;
+    f->pos_lp = si->lp;
+    f->pos_read = streamFilterReads;
+    f->pos_count = 0;
+    unsigned char *p = si->master_fields_start;
+    unsigned char buf[LP_INTBUF_SIZE];
+    for (uint64_t k = 0; k < si->master_fields_count && f->pos_count < f->nfields; k++) {
+        int64_t len;
+        unsigned char *name = lpGet(p, &len, buf);
+        for (int j = 0; j < f->nfields; j++) {
+            if ((size_t)len != sdslen(f->fields[j]) ||
+                memcmp(name, f->fields[j], len) != 0) continue;
+            /* The first occurrence of a field is its value. */
+            int seen = 0;
+            for (int i = 0; i < f->pos_count; i++) {
+                if (f->pos_field[i] == j) {
+                    seen = 1;
+                    break;
+                }
+            }
+            if (!seen) {
+                f->pos_field[f->pos_count] = j;
+                f->pos_index[f->pos_count] = k;
+                f->pos_count++;
+            }
+            break;
+        }
+        p = lpNext(si->lp, p);
+    }
+}
+
 /* Does the entry the iterator is positioned at (right after
  * streamIteratorGetID()) match 'f'? Reads only up to the last field the
  * filter names, and leaves the iterator where it was, so the caller can
@@ -2339,6 +2381,22 @@ static int streamFilterMatchIterator(streamFilter *f, streamIterator *si, int64_
     for (int j = 0; j < f->nfields; j++) vals[j] = NULL;
 
     unsigned char *saved_ele = si->lp_ele, *saved_master = si->master_fields_ptr;
+    if (si->entry_flags & STREAM_ITEM_FLAG_SAMEFIELDS) {
+        /* Read the values by position (streamFilterNodePositions), starting
+         * from the first value, where the iterator stands. */
+        streamFilterNodePositions(f, si);
+        unsigned char *p = si->lp_ele;
+        int64_t at = 0;
+        for (int i = 0; i < f->pos_count; i++) {
+            int j = f->pos_field[i];
+            if (f->pos_index[i] > at) {
+                p = lpNextN(si->lp, p, f->pos_index[i] - at);
+                at = f->pos_index[i];
+            }
+            vals[j] = lpGet(p, &lens[j], bufs[j]);
+        }
+        numfields = 0; /* Nothing left for the loop below. */
+    }
     int found = 0;
     for (int64_t k = 0; k < numfields && found < f->nfields; k++) {
         unsigned char *field, *value;
@@ -2373,11 +2431,13 @@ static int streamFilterMatchIterator(streamFilter *f, streamIterator *si, int64_
 }
 
 /* Move past the fields of the entry the iterator is positioned at without
- * reading them: the next streamIteratorGetID() expects them consumed. */
+ * reading them: the next streamIteratorGetID() expects them consumed.
+ * lpNextN() range-checks each step and fully validates only where it lands,
+ * the entry's lp-count, instead of validating every field and value. */
 static void streamIteratorSkipFields(streamIterator *si, int64_t numfields) {
     int64_t elements = (si->entry_flags & STREAM_ITEM_FLAG_SAMEFIELDS) ?
                        numfields : numfields * 2;
-    while (elements--) si->lp_ele = lpNext(si->lp, si->lp_ele);
+    si->lp_ele = lpNextN(si->lp, si->lp_ele, elements);
 }
 
 /* Does the group take the entry the iterator is positioned at? An
@@ -2440,6 +2500,7 @@ static int streamFilterSkip(stream *s, streamCG *group, long long budget, long l
 
     *examined = 0;
     if (streamIncrID(&start) != C_OK) return res;
+    streamFilterReads++;
     streamIteratorStart(&si, s, &start, NULL, 0);
     while (streamIteratorGetID(&si, &id, &numfields)) {
         if (*examined >= budget) {
@@ -2486,6 +2547,7 @@ static int streamFilterWakeCheck(stream *s, streamCG *cg, long long budget) {
     long long fresh = 0;
     int wake = 0;
     streamIncrID(&start); /* Cannot overflow: wake_id < last_id. */
+    streamFilterReads++;
     streamIteratorStart(&si, s, &start, NULL, 1);
     while (streamIteratorGetID(&si, &id, &numfields)) {
         if (streamCGMatchEntry(s, cg, &si, numfields)) {
@@ -2700,6 +2762,7 @@ size_t streamReplyWithRange(client *c, stream *s, streamReplyRangeArgs *args) {
 
     if (!(flags & STREAM_RWR_RAWENTRIES) && !arraylen_ptr)
         arraylen_ptr = addReplyDeferredLen(c);
+    if (filtered) streamFilterReads++;
     streamIteratorStart(&si,s,start,end,rev);
     while (streamIteratorGetID(&si,&id,&numfields)) {
         /* Break before delivering the entry so it is neither sent nor added to
