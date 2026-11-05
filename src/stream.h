@@ -124,6 +124,10 @@ typedef struct streamCG {
     rax *consumers;         /* A radix tree representing the consumers by name
                                and their associated representation in the form
                                of streamConsumer structures. */
+    struct streamFilter *filter; /* Entries this group delivers with ">", or
+                                    NULL for all of them (streamfilter.h). */
+    long long maxscan;      /* Entries a filtered read examines at most per
+                               stream, 0 for stream-filter-max-scan. */
 } streamCG;
 
 /* A specific consumer in a consumer group.  */
@@ -183,6 +187,9 @@ typedef struct streamReplyRangeArgs {
                                    MAXSIZE is checked against the absolute
                                    c->net_output_bytes_curr_cmd. */
     size_t emitted_before;      /* Entries already emitted before this call. */
+    long long scan_budget;      /* With a filtered group: entries to examine
+                                   at most for new deliveries. 0 means the
+                                   group's filter is not applied. */
 } streamReplyRangeArgs;
 
 /* Prototypes of exported APIs. */
@@ -208,6 +215,9 @@ streamCG *streamLookupCG(stream *s, sds groupname);
 streamConsumer *streamLookupConsumer(streamCG *cg, sds name);
 streamConsumer *streamCreateConsumer(stream *s, streamCG *cg, sds name, robj *key, int dbid, int flags);
 streamCG *streamCreateCG(stream *s, char *name, size_t namelen, streamID *id, long long entries_read);
+void streamCGSetFilter(stream *s, streamCG *cg, struct streamFilter *f);
+streamCG *streamLookupElseCG(stream *s, streamCG *except);
+int streamHasGroupFilters(stream *s);
 streamNACK *streamCreateNACK(stream *s, streamConsumer *consumer, streamID *id);
 void streamEncodeID(void *buf, streamID *id);
 void streamDecodeID(void *buf, streamID *id);

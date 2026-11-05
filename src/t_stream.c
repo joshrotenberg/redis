@@ -10,6 +10,7 @@
 #include "server.h"
 #include "endianconv.h"
 #include "stream.h"
+#include "streamfilter.h"
 #include "xxhash.h"
 #include <string.h>
 
@@ -459,6 +460,8 @@ robj *streamDup(robj *o) {
                                           cg->entries_read);
 
         serverAssert(new_cg != NULL);
+        if (cg->filter) streamCGSetFilter(new_s, new_cg, streamFilterDup(cg->filter));
+        new_cg->maxscan = cg->maxscan;
 
         /* Consumer Group PEL -- walk the time-ordered list so we can
          * append directly and preserve NACK zone structure. */
@@ -1947,6 +1950,19 @@ int streamRangeHasTombstones(stream *s, streamID *start, streamID *end) {
     return 0;
 }
 
+/* Replies with the "filter" and "maxscan" fields of a group's XINFO entry:
+ * the expression as given ("ELSE" for an ELSE group, null for none) and the
+ * scan budget its reads use. */
+static void streamReplyWithCGFilter(client *c, streamCG *cg) {
+    addReplyBulkCString(c,"filter");
+    if (cg->filter)
+        addReplyBulkCBuffer(c,cg->filter->source,sdslen(cg->filter->source));
+    else
+        addReplyNull(c);
+    addReplyBulkCString(c,"maxscan");
+    addReplyLongLong(c,cg->maxscan ? cg->maxscan : server.stream_filter_max_scan);
+}
+
 /* Replies with a consumer group's current lag, that is the number of messages
  * in the stream that are yet to be delivered. In case that the lag isn't
  * available due to fragmentation, the reply to the client is a null. */
@@ -2297,6 +2313,150 @@ static inline int streamReplyMaxsizeReached(client *c, long long maxsize, size_t
  * streamReplyWithRange() in order to emit single entries (found in the
  * PEL by ID) to the client. This is the use case for the STREAM_RWR_RAWENTRIES
  * flag. */
+/* -----------------------------------------------------------------------
+ * Consumer group filters
+ * ----------------------------------------------------------------------- */
+
+#define STREAM_FILTER_STACK_FIELDS 16
+
+/* Does the entry the iterator is positioned at (right after
+ * streamIteratorGetID()) match 'f'? Reads only up to the last field the
+ * filter names, and leaves the iterator where it was, so the caller can
+ * still read the entry's fields. */
+static int streamFilterMatchIterator(streamFilter *f, streamIterator *si, int64_t numfields) {
+    const unsigned char *stack_vals[STREAM_FILTER_STACK_FIELDS];
+    int64_t stack_lens[STREAM_FILTER_STACK_FIELDS];
+    unsigned char stack_bufs[STREAM_FILTER_STACK_FIELDS][LP_INTBUF_SIZE];
+    const unsigned char **vals = stack_vals;
+    int64_t *lens = stack_lens;
+    unsigned char (*bufs)[LP_INTBUF_SIZE] = stack_bufs;
+    if (f->nfields > STREAM_FILTER_STACK_FIELDS) {
+        vals = zmalloc(sizeof(*vals) * f->nfields);
+        lens = zmalloc(sizeof(*lens) * f->nfields);
+        bufs = zmalloc(sizeof(*bufs) * f->nfields);
+    }
+    for (int j = 0; j < f->nfields; j++) vals[j] = NULL;
+
+    unsigned char *saved_ele = si->lp_ele, *saved_master = si->master_fields_ptr;
+    int found = 0;
+    for (int64_t k = 0; k < numfields && found < f->nfields; k++) {
+        unsigned char *field, *value;
+        int64_t flen, vlen;
+        streamIteratorGetField(si, &field, &value, &flen, &vlen);
+        for (int j = 0; j < f->nfields; j++) {
+            /* The first occurrence of a field is its value. */
+            if (vals[j] || (size_t)flen != sdslen(f->fields[j]) ||
+                memcmp(field, f->fields[j], flen) != 0) continue;
+            /* An integer-encoded value lives in the iterator's buffer, which
+             * the next read overwrites. */
+            if (value == si->value_buf) {
+                memcpy(bufs[j], value, vlen);
+                value = bufs[j];
+            }
+            vals[j] = value;
+            lens[j] = vlen;
+            found++;
+            break;
+        }
+    }
+    si->lp_ele = saved_ele;
+    si->master_fields_ptr = saved_master;
+
+    int match = streamFilterEval(f, vals, lens);
+    if (vals != stack_vals) {
+        zfree(vals);
+        zfree(lens);
+        zfree(bufs);
+    }
+    return match;
+}
+
+/* Move past the fields of the entry the iterator is positioned at without
+ * reading them: the next streamIteratorGetID() expects them consumed. */
+static void streamIteratorSkipFields(streamIterator *si, int64_t numfields) {
+    int64_t elements = (si->entry_flags & STREAM_ITEM_FLAG_SAMEFIELDS) ?
+                       numfields : numfields * 2;
+    while (elements--) si->lp_ele = lpNext(si->lp, si->lp_ele);
+}
+
+/* Does the group take the entry the iterator is positioned at? An
+ * unfiltered group takes everything; an ELSE group takes what no other
+ * filtered group on the stream matches. */
+static int streamCGMatchEntry(stream *s, streamCG *cg, streamIterator *si, int64_t numfields) {
+    streamFilter *f = cg->filter;
+    if (!f) return 1;
+    if (!f->is_else) return streamFilterMatchIterator(f, si, numfields);
+
+    int taken = 0;
+    raxIterator ri;
+    raxStart(&ri, s->cgroups);
+    raxSeek(&ri, "^", NULL, 0);
+    while (raxNext(&ri)) {
+        streamCG *other = ri.data;
+        if (other == cg || !other->filter || other->filter->is_else) continue;
+        if (streamFilterMatchIterator(other->filter, si, numfields)) {
+            taken = 1;
+            break;
+        }
+    }
+    raxStop(&ri);
+    return !taken;
+}
+
+/* Move the group's last delivered ID forward to 'id', keeping entries_read
+ * in step. Returns 1 if the ID moved. */
+static int streamCGAdvance(stream *s, streamCG *group, streamID *id) {
+    if (streamCompareID(id, &group->last_id) <= 0) return 0;
+    if (group->entries_read != SCG_INVALID_ENTRIES_READ &&
+        streamCompareID(&group->last_id, &s->first_id) >= 0 &&
+        !streamRangeHasTombstones(s, &group->last_id, NULL))
+    {
+        /* A valid counter and no tombstones between the group's last-delivered-id
+         * and the stream's last-generated-id mean we can increment the read counter
+         * to keep tracking the group's progress. */
+        group->entries_read++;
+    } else if (s->entries_added) {
+        /* The group's counter may be invalid, so we try to obtain it. */
+        group->entries_read = streamEstimateDistanceFromFirstEverEntry(s, id);
+    }
+    streamUpdateCGroupLastId(s, group, id);
+    return 1;
+}
+
+#define STREAM_FILTER_SKIP_END 0        /* No match up to the end of the stream. */
+#define STREAM_FILTER_SKIP_MATCH 1      /* The entry after the cursor matches. */
+#define STREAM_FILTER_SKIP_BUDGET 2     /* The scan budget ran out first. */
+
+/* Move a filtered group's cursor past the entries after it that the group
+ * does not take, stopping before the first one it does, at the end of the
+ * stream, or once 'budget' entries were examined. '*examined' is set to the
+ * number of entries skipped. */
+static int streamFilterSkip(stream *s, streamCG *group, long long budget, long long *examined) {
+    streamIterator si;
+    streamID start = group->last_id, id;
+    int64_t numfields;
+    int res = STREAM_FILTER_SKIP_END;
+
+    *examined = 0;
+    if (streamIncrID(&start) != C_OK) return res;
+    streamIteratorStart(&si, s, &start, NULL, 0);
+    while (streamIteratorGetID(&si, &id, &numfields)) {
+        if (*examined >= budget) {
+            res = STREAM_FILTER_SKIP_BUDGET;
+            break;
+        }
+        if (streamCGMatchEntry(s, group, &si, numfields)) {
+            res = STREAM_FILTER_SKIP_MATCH;
+            break;
+        }
+        streamIteratorSkipFields(&si, numfields);
+        streamCGAdvance(s, group, &id);
+        (*examined)++;
+    }
+    streamIteratorStop(&si);
+    return res;
+}
+
 #define STREAM_RWR_NOACK (1<<0)         /* Do not create entries in the PEL. */
 #define STREAM_RWR_RAWENTRIES (1<<1)    /* Do not emit protocol for array
                                            boundaries, just the entries. */
@@ -2315,6 +2475,11 @@ size_t streamReplyWithRange(client *c, stream *s, streamReplyRangeArgs *args) {
     unsigned long *propCount = args->propCount;
     long long maxsize = args->maxsize;
     size_t emitted_before = args->emitted_before;
+    /* scan_budget > 0: apply the group's filter, examining at most that many
+     * entries; < 0: apply it with nothing left to examine; 0: no filter. */
+    int filtered = group && group->filter && args->scan_budget != 0;
+    long long scan_budget = args->scan_budget < 0 ? 0 : args->scan_budget;
+    long long scanned = 0;
     void *arraylen_ptr = NULL;
     size_t arraylen = 0;
     streamIterator si;
@@ -2458,26 +2623,24 @@ size_t streamReplyWithRange(client *c, stream *s, streamReplyRangeArgs *args) {
         if (streamReplyMaxsizeReached(c, maxsize, emitted_before + arraylen))
             break;
 
-        /* Update the group last_id if needed. */
-        if (group && streamCompareID(&id,&group->last_id) > 0) {
-            if (group->entries_read != SCG_INVALID_ENTRIES_READ &&
-                streamCompareID(&group->last_id, &s->first_id) >= 0 &&
-                !streamRangeHasTombstones(s,&group->last_id,NULL))
-            {
-                /* A valid counter and no tombstones between the group's last-delivered-id
-                 * and the stream's last-generated-id mean we can increment the read counter
-                 * to keep tracking the group's progress. */
-                group->entries_read++;
-            } else if (s->entries_added) {
-                /* The group's counter may be invalid, so we try to obtain it. */
-                group->entries_read = streamEstimateDistanceFromFirstEverEntry(s,&id);
-            }
-            streamUpdateCGroupLastId(s, group, &id);
-            /* In the past, we would only set it when NOACK was specified. And in
-             * #9127, XCLAIM did not propagate entries_read in ACK, which would
-             * cause entries_read to be inconsistent between master and replicas,
-             * so here we call streamPropagateGroupID unconditionally. */
-            propagate_last_id = 1;
+        /* A filtered group examines at most 'scan_budget' entries. */
+        if (filtered) {
+            if (scanned >= scan_budget) break;
+            scanned++;
+        }
+
+        /* Update the group last_id if needed. In the past, we would only
+         * propagate it when NOACK was specified. And in #9127, XCLAIM did not
+         * propagate entries_read in ACK, which would cause entries_read to be
+         * inconsistent between master and replicas, so here we call
+         * streamPropagateGroupID unconditionally. */
+        if (group && streamCGAdvance(s, group, &id)) propagate_last_id = 1;
+
+        /* An entry the group does not take is skipped: the cursor has moved
+         * past it, but it is neither sent nor added to the PEL. */
+        if (filtered && !streamCGMatchEntry(s, group, &si, numfields)) {
+            streamIteratorSkipFields(&si, numfields);
+            continue;
         }
 
         if (min_idle_time != -1) {
@@ -3060,6 +3223,7 @@ void xreadCommand(client *c) {
     long long count = 0;
     long long maxcount = 0; /* 0 means, no MAXCOUNT argument given. */
     long long maxsize = 0;  /* 0 means, no MAXSIZE argument given. */
+    long long maxscan = 0;  /* 0 means, no MAXSCAN argument given. */
     int streams_count = 0;
     int streams_arg = 0;
     int noack = 0;          /* True if NOACK option was specified. */
@@ -3114,6 +3278,19 @@ void xreadCommand(client *c) {
                 return;
             if (maxsize <= 0) {
                 addReplyError(c,"MAXSIZE must be a positive integer");
+                return;
+            }
+        } else if (!strcasecmp(o,"MAXSCAN") && moreargs) {
+            if (!xreadgroup) {
+                addReplyError(c,"The MAXSCAN option is only supported by "
+                                "XREADGROUP. You called XREAD instead.");
+                return;
+            }
+            i++;
+            if (getLongLongFromObjectOrReply(c,c->argv[i],&maxscan,NULL) != C_OK)
+                return;
+            if (maxscan <= 0) {
+                addReplyError(c,"MAXSCAN must be a positive integer");
                 return;
             }
         } else if (!strcasecmp(o,"STREAMS") && moreargs) {
@@ -3280,6 +3457,7 @@ void xreadCommand(client *c) {
         int serve_synchronously = 0;
         int serve_history = 0; /* True for XREADGROUP with ID != ">". */
         int consumer_created = 0;
+        long long filter_budget = 0; /* streamReplyRangeArgs.scan_budget */
         streamConsumer *consumer = NULL; /* Unused if XREAD */
         streamPropInfo spi = {c->argv[streams_arg+i],groupname}; /* Unused if XREAD */
 
@@ -3324,11 +3502,34 @@ void xreadCommand(client *c) {
                 /* We also want to serve a consumer in a consumer group
                  * synchronously in case the group top item delivered is smaller
                  * than what the stream has inside. */
-                streamID maxid, *last = &groups[i]->last_id;
+                streamCG *group = groups[i];
+                streamID maxid;
                 streamLastValidID(s, &maxid);
-                if (streamCompareID(&maxid, last) > 0) {
-                    serve_synchronously = 1;
-                    *gt = *last;
+                if (streamCompareID(&maxid, &group->last_id) > 0) {
+                    if (group->filter) {
+                        /* A filtered group is served only when an entry it
+                         * takes is waiting, or when its scan budget runs out
+                         * first (an empty entry list: read again). Entries
+                         * it does not take are skipped for good. */
+                        long long budget = maxscan ? maxscan :
+                                           group->maxscan ? group->maxscan :
+                                           server.stream_filter_max_scan;
+                        long long examined;
+                        int res = streamFilterSkip(s, group, budget, &examined);
+                        if (examined) {
+                            streamPropagateGroupID(c, spi.keyname, group, spi.groupname);
+                            server.dirty++;
+                            keyModified(c,c->db,c->argv[streams_arg+i],o,0); /* only update LRM */
+                        }
+                        if (res != STREAM_FILTER_SKIP_END) {
+                            serve_synchronously = 1;
+                            filter_budget = res == STREAM_FILTER_SKIP_MATCH ?
+                                            budget - examined : -1;
+                        }
+                    } else {
+                        serve_synchronously = 1;
+                    }
+                    *gt = group->last_id;
                 }
             }
             consumer = streamLookupConsumer(groups[i],consumername->ptr);
@@ -3415,6 +3616,7 @@ void xreadCommand(client *c) {
                 .group = groups ? groups[i] : NULL, .consumer = consumer,
                 .flags = flags, .spi = &spi, .propCount = &propCount,
                 .maxsize = maxsize_threshold, .emitted_before = total_entries,
+                .scan_budget = filter_budget,
             };
             /* New deliveries (XREADGROUP without NOACK) add entries to this
              * group's PEL; snapshot it around the read for INFO Streams. */
@@ -3732,6 +3934,8 @@ streamCG *streamCreateCG(stream *s, char *name, size_t namelen, streamID *id, lo
     cg->last_id.seq = 0;
     streamUpdateCGroupLastId(s, cg, id);
     cg->entries_read = entries_read;
+    cg->filter = NULL;
+    cg->maxscan = 0;
     streamDistribStamp *st = (streamDistribStamp *) cg->pel->metadata;
     st->epoch = STREAM_DISTRIB_NEVER_COUNTED;
     st->counted = 0;
@@ -3749,9 +3953,57 @@ static void streamFreeCG(stream *s, streamCG *cg) {
     serverAssert(cg->pel_time_head == NULL && cg->pel_time_tail == NULL && cg->pel_nack_tail == NULL);
     
     raxFreeWithCbAndContext(cg->consumers, streamFreeConsumerGeneric, s);
+    streamCGSetFilter(s, cg, NULL);
     size_t usable;
     zfree_usable(cg, &usable);
     s->alloc_size -= usable;
+}
+
+/* Replace the group's filter with 'f' (which the group now owns), or remove
+ * it when 'f' is NULL, keeping the stream's alloc_size in step. */
+void streamCGSetFilter(stream *s, streamCG *cg, streamFilter *f) {
+    if (cg->filter) {
+        s->alloc_size -= cg->filter->alloc_size;
+        streamFilterFree(cg->filter);
+    }
+    cg->filter = f;
+    if (f) s->alloc_size += f->alloc_size;
+}
+
+/* Does any group of the stream have a filter or a scan budget? */
+int streamHasGroupFilters(stream *s) {
+    if (s->cgroups == NULL) return 0;
+    int found = 0;
+    raxIterator ri;
+    raxStart(&ri, s->cgroups);
+    raxSeek(&ri, "^", NULL, 0);
+    while (raxNext(&ri)) {
+        streamCG *cg = ri.data;
+        if (cg->filter || cg->maxscan) {
+            found = 1;
+            break;
+        }
+    }
+    raxStop(&ri);
+    return found;
+}
+
+/* An ELSE group already on the stream, other than 'except'. */
+streamCG *streamLookupElseCG(stream *s, streamCG *except) {
+    if (s->cgroups == NULL) return NULL;
+    streamCG *found = NULL;
+    raxIterator ri;
+    raxStart(&ri, s->cgroups);
+    raxSeek(&ri, "^", NULL, 0);
+    while (raxNext(&ri)) {
+        streamCG *cg = ri.data;
+        if (cg != except && cg->filter && cg->filter->is_else) {
+            found = cg;
+            break;
+        }
+    }
+    raxStop(&ri);
+    return found;
 }
 
 /* Destroy a consumer group and clean up all associated references. */
@@ -3867,19 +4119,47 @@ void xgroupCommand(client *c) {
     char *opt = c->argv[1]->ptr; /* Subcommand name. */
     int mkstream = 0;
     long long entries_read = SCG_INVALID_ENTRIES_READ;
+    robj *filter_arg = NULL;    /* CREATE ... FILTER <expr> */
+    int else_group = 0;         /* CREATE ... ELSE */
+    long long maxscan = -1;     /* MAXSCAN <n> | DEFAULT; -1 when not given. */
     robj *o;
     size_t old_alloc = 0;
 
     /* Everything but the "HELP" option requires a key and group name. */
     if (c->argc >= 4) {
-        /* Parse optional arguments for CREATE and SETID */
+        /* Parse optional arguments for CREATE, SETID and SETFILTER */
         int i = 5;
         int create_subcmd = !strcasecmp(opt,"CREATE");
         int setid_subcmd = !strcasecmp(opt,"SETID");
+        int setfilter_subcmd = !strcasecmp(opt,"SETFILTER");
         while (i < c->argc) {
             if (create_subcmd && !strcasecmp(c->argv[i]->ptr,"MKSTREAM")) {
                 mkstream = 1;
                 i++;
+            } else if (create_subcmd && !filter_arg && !else_group &&
+                       !strcasecmp(c->argv[i]->ptr,"FILTER") && i + 1 < c->argc) {
+                if (!strcasecmp(c->argv[i+1]->ptr,"ELSE"))
+                    else_group = 1;
+                else
+                    filter_arg = c->argv[i+1];
+                i += 2;
+            } else if (create_subcmd && !filter_arg && !else_group &&
+                       !strcasecmp(c->argv[i]->ptr,"ELSE")) {
+                else_group = 1;
+                i++;
+            } else if ((create_subcmd || setfilter_subcmd) && maxscan == -1 &&
+                       !strcasecmp(c->argv[i]->ptr,"MAXSCAN") && i + 1 < c->argc) {
+                if (!strcasecmp(c->argv[i+1]->ptr,"DEFAULT")) {
+                    maxscan = 0;
+                } else {
+                    if (getLongLongFromObjectOrReply(c,c->argv[i+1],&maxscan,NULL) != C_OK)
+                        return;
+                    if (maxscan <= 0) {
+                        addReplyError(c,"MAXSCAN must be a positive integer or DEFAULT");
+                        return;
+                    }
+                }
+                i += 2;
             } else if ((create_subcmd || setid_subcmd) && !strcasecmp(c->argv[i]->ptr,"ENTRIESREAD") && i + 1 < c->argc) {
                 if (getLongLongFromObjectOrReply(c,c->argv[i+1],&entries_read,NULL) != C_OK)
                     return;
@@ -3916,6 +4196,7 @@ void xgroupCommand(client *c) {
         /* Certain subcommands require the group to exist. */
         if ((cg = streamLookupCG(s,grpname)) == NULL &&
             (!strcasecmp(opt,"SETID") ||
+             !strcasecmp(opt,"SETFILTER") ||
              !strcasecmp(opt,"CREATECONSUMER") ||
              !strcasecmp(opt,"DELCONSUMER")))
         {
@@ -3935,6 +4216,11 @@ void xgroupCommand(client *c) {
 "      Create the empty stream if it does not exist.",
 "    * ENTRIESREAD entries_read",
 "      Set the group's entries_read counter (internal use).",
+"    * FILTER <expr> | ELSE",
+"      Deliver with '>' only the entries the expression matches, or (ELSE)",
+"      the entries no other filtered group on the stream matches.",
+"    * MAXSCAN <n>",
+"      Entries a filtered read examines at most per stream.",
 "CREATECONSUMER <key> <groupname> <consumer>",
 "    Create a new consumer in the specified group.",
 "DELCONSUMER <key> <groupname> <consumer>",
@@ -3943,10 +4229,12 @@ void xgroupCommand(client *c) {
 "    Remove the specified group.",
 "SETID <key> <groupname> <id|$> [ENTRIESREAD entries_read]",
 "    Set the current group ID and entries_read counter.",
+"SETFILTER <key> <groupname> <expr|ELSE|NONE> [MAXSCAN <n>|DEFAULT]",
+"    Set or remove the group's filter, from the next delivery on.",
 NULL
         };
         addReplyHelp(c, help);
-    } else if (!strcasecmp(opt,"CREATE") && (c->argc >= 5 && c->argc <= 8)) {
+    } else if (!strcasecmp(opt,"CREATE") && c->argc >= 5) {
         streamID id;
         if (!strcmp(c->argv[4]->ptr,"$")) {
             if (s) {
@@ -3957,6 +4245,23 @@ NULL
             }
         } else if (streamParseStrictIDOrReply(c,c->argv[4],&id,0,NULL) != C_OK) {
             return;
+        }
+
+        streamFilter *filter = NULL;
+        if (filter_arg) {
+            sds err;
+            filter = streamFilterParse(filter_arg->ptr, sdslen(filter_arg->ptr), &err);
+            if (filter == NULL) {
+                addReplyErrorFormat(c,"invalid filter: %s",err);
+                sdsfree(err);
+                return;
+            }
+        } else if (else_group) {
+            if (s && streamLookupElseCG(s,NULL)) {
+                addReplyError(c,"The stream already has an ELSE group");
+                return;
+            }
+            filter = streamFilterCreateElse();
         }
 
         /* Handle the MKSTREAM option now that the command can no longer fail. */
@@ -3978,6 +4283,8 @@ NULL
         int64_t old_cgroups = streamStreamSample(s, STREAM_DISTRIB_STREAMS_CGROUPS);
         streamCG *cg = streamCreateCG(s,grpname,sdslen(grpname),&id,entries_read);
         if (cg) {
+            if (filter) streamCGSetFilter(s,cg,filter);
+            if (maxscan > 0) cg->maxscan = maxscan;
             if (server.memory_tracking_enabled)
                 updateSlotAllocSize(c->db,getKeySlot(c->argv[2]->ptr),o,old_alloc,kvobjAllocSize(o));
             streamUpdateStreamStat(c->db, s, STREAM_DISTRIB_STREAMS_CGROUPS, old_cgroups); /* the stream gained a group */
@@ -3989,8 +4296,39 @@ NULL
                                 c->argv[2],c->db->id);
             keyModified(c,c->db,c->argv[2],o,0);
         } else {
+            streamFilterFree(filter);
             addReplyError(c,"-BUSYGROUP Consumer Group name already exists");
         }
+    } else if (!strcasecmp(opt,"SETFILTER") && (c->argc == 5 || c->argc == 7)) {
+        sds expr = c->argv[4]->ptr;
+        streamFilter *filter = NULL;
+        if (!strcasecmp(expr,"NONE")) {
+            filter = NULL;
+        } else if (!strcasecmp(expr,"ELSE")) {
+            if (streamLookupElseCG(s,cg)) {
+                addReplyError(c,"The stream already has an ELSE group");
+                return;
+            }
+            filter = streamFilterCreateElse();
+        } else {
+            sds err;
+            filter = streamFilterParse(expr, sdslen(expr), &err);
+            if (filter == NULL) {
+                addReplyErrorFormat(c,"invalid filter: %s",err);
+                sdsfree(err);
+                return;
+            }
+        }
+        if (server.memory_tracking_enabled)
+            old_alloc = kvobjAllocSize(o);
+        streamCGSetFilter(s,cg,filter);
+        if (maxscan >= 0) cg->maxscan = maxscan;
+        if (server.memory_tracking_enabled)
+            updateSlotAllocSize(c->db,getKeySlot(c->argv[2]->ptr),o,old_alloc,kvobjAllocSize(o));
+        addReply(c,shared.ok);
+        server.dirty++;
+        notifyKeyspaceEvent(NOTIFY_STREAM,"xgroup-setfilter",c->argv[2],c->db->id);
+        keyModified(c,c->db,c->argv[2],o,0);
     } else if (!strcasecmp(opt,"SETID") && (c->argc == 5 || c->argc == 7)) {
         streamID id;
         if (!strcmp(c->argv[4]->ptr,"$")) {
@@ -5749,7 +6087,8 @@ void xinfoReplyWithStreamInfo(client *c, robj *key, kvobj *kv) {
             raxSeek(&ri_cgroups,"^",NULL,0);
             while(raxNext(&ri_cgroups)) {
                 streamCG *cg = ri_cgroups.data;
-                addReplyMapLen(c,8);
+                int filtered = cg->filter != NULL || cg->maxscan;
+                addReplyMapLen(c,filtered ? 10 : 8);
 
                 /* Name */
                 addReplyBulkCString(c,"name");
@@ -5778,6 +6117,9 @@ void xinfoReplyWithStreamInfo(client *c, robj *key, kvobj *kv) {
                 /* NACKed entries count (entries in the NACK zone) */
                 addReplyBulkCString(c,"nacked-count");
                 addReplyLongLong(c,pelListNackedCount(cg));
+
+                /* Filter and scan budget, only for groups that have them. */
+                if (filtered) streamReplyWithCGFilter(c,cg);
 
                 /* Group PEL */
                 addReplyBulkCString(c,"pending");
@@ -5956,7 +6298,8 @@ NULL
         raxSeek(&ri,"^",NULL,0);
         while(raxNext(&ri)) {
             streamCG *cg = ri.data;
-            addReplyMapLen(c,6);
+            int filtered = cg->filter != NULL || cg->maxscan;
+            addReplyMapLen(c,filtered ? 8 : 6);
             addReplyBulkCString(c,"name");
             addReplyBulkCBuffer(c,ri.key,ri.key_len);
             addReplyBulkCString(c,"consumers");
@@ -5973,6 +6316,9 @@ NULL
             }
             addReplyBulkCString(c,"lag");
             streamReplyWithCGLag(c,s,cg);
+            /* Only groups with a filter or a scan budget report them, so the
+             * reply for every other group is unchanged. */
+            if (filtered) streamReplyWithCGFilter(c,cg);
         }
         raxStop(&ri);
     } else if (!strcasecmp(opt,"STREAM")) {

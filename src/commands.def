@@ -11859,6 +11859,7 @@ struct COMMAND_ARG XDELEX_Args[] = {
 /* XGROUP CREATE history */
 commandHistory XGROUP_CREATE_History[] = {
 {"7.0.0","Added the `entries_read` named argument."},
+{"8.14.0","Added the `FILTER`, `ELSE` and `MAXSCAN` options."},
 };
 #endif
 
@@ -11880,6 +11881,12 @@ struct COMMAND_ARG XGROUP_CREATE_id_selector_Subargs[] = {
 {MAKE_ARG("new-id",ARG_TYPE_PURE_TOKEN,-1,"$",NULL,NULL,CMD_ARG_NONE,0,NULL)},
 };
 
+/* XGROUP CREATE filter_selector argument table */
+struct COMMAND_ARG XGROUP_CREATE_filter_selector_Subargs[] = {
+{MAKE_ARG("expression",ARG_TYPE_STRING,-1,"FILTER",NULL,NULL,CMD_ARG_NONE,0,NULL)},
+{MAKE_ARG("else",ARG_TYPE_PURE_TOKEN,-1,"ELSE",NULL,NULL,CMD_ARG_NONE,0,NULL)},
+};
+
 /* XGROUP CREATE argument table */
 struct COMMAND_ARG XGROUP_CREATE_Args[] = {
 {MAKE_ARG("key",ARG_TYPE_KEY,0,NULL,NULL,NULL,CMD_ARG_NONE,0,NULL)},
@@ -11887,6 +11894,8 @@ struct COMMAND_ARG XGROUP_CREATE_Args[] = {
 {MAKE_ARG("id-selector",ARG_TYPE_ONEOF,-1,NULL,NULL,NULL,CMD_ARG_NONE,2,NULL),.subargs=XGROUP_CREATE_id_selector_Subargs},
 {MAKE_ARG("mkstream",ARG_TYPE_PURE_TOKEN,-1,"MKSTREAM",NULL,NULL,CMD_ARG_OPTIONAL,0,NULL)},
 {MAKE_ARG("entriesread",ARG_TYPE_INTEGER,-1,"ENTRIESREAD",NULL,NULL,CMD_ARG_OPTIONAL,0,NULL),.display_text="entries-read"},
+{MAKE_ARG("filter-selector",ARG_TYPE_ONEOF,-1,NULL,NULL,"8.14.0",CMD_ARG_OPTIONAL,2,NULL),.subargs=XGROUP_CREATE_filter_selector_Subargs},
+{MAKE_ARG("maxscan",ARG_TYPE_INTEGER,-1,"MAXSCAN",NULL,"8.14.0",CMD_ARG_OPTIONAL,0,NULL)},
 };
 
 /********** XGROUP CREATECONSUMER ********************/
@@ -11983,6 +11992,46 @@ struct COMMAND_ARG XGROUP_DESTROY_Args[] = {
 #define XGROUP_HELP_Keyspecs NULL
 #endif
 
+/********** XGROUP SETFILTER ********************/
+
+#ifndef SKIP_CMD_HISTORY_TABLE
+/* XGROUP SETFILTER history */
+#define XGROUP_SETFILTER_History NULL
+#endif
+
+#ifndef SKIP_CMD_TIPS_TABLE
+/* XGROUP SETFILTER tips */
+#define XGROUP_SETFILTER_Tips NULL
+#endif
+
+#ifndef SKIP_CMD_KEY_SPECS_TABLE
+/* XGROUP SETFILTER key specs */
+keySpec XGROUP_SETFILTER_Keyspecs[1] = {
+{NULL,CMD_KEY_RW|CMD_KEY_UPDATE,KSPEC_BS_INDEX,.bs.index={2},KSPEC_FK_RANGE,.fk.range={0,1,0}}
+};
+#endif
+
+/* XGROUP SETFILTER filter_selector argument table */
+struct COMMAND_ARG XGROUP_SETFILTER_filter_selector_Subargs[] = {
+{MAKE_ARG("expression",ARG_TYPE_STRING,-1,NULL,NULL,NULL,CMD_ARG_NONE,0,NULL)},
+{MAKE_ARG("else",ARG_TYPE_PURE_TOKEN,-1,"ELSE",NULL,NULL,CMD_ARG_NONE,0,NULL)},
+{MAKE_ARG("none",ARG_TYPE_PURE_TOKEN,-1,"NONE",NULL,NULL,CMD_ARG_NONE,0,NULL)},
+};
+
+/* XGROUP SETFILTER maxscan_selector argument table */
+struct COMMAND_ARG XGROUP_SETFILTER_maxscan_selector_Subargs[] = {
+{MAKE_ARG("maxscan",ARG_TYPE_INTEGER,-1,NULL,NULL,NULL,CMD_ARG_NONE,0,NULL)},
+{MAKE_ARG("default",ARG_TYPE_PURE_TOKEN,-1,"DEFAULT",NULL,NULL,CMD_ARG_NONE,0,NULL)},
+};
+
+/* XGROUP SETFILTER argument table */
+struct COMMAND_ARG XGROUP_SETFILTER_Args[] = {
+{MAKE_ARG("key",ARG_TYPE_KEY,0,NULL,NULL,NULL,CMD_ARG_NONE,0,NULL)},
+{MAKE_ARG("group",ARG_TYPE_STRING,-1,NULL,NULL,NULL,CMD_ARG_NONE,0,NULL)},
+{MAKE_ARG("filter-selector",ARG_TYPE_ONEOF,-1,NULL,NULL,NULL,CMD_ARG_NONE,3,NULL),.subargs=XGROUP_SETFILTER_filter_selector_Subargs},
+{MAKE_ARG("maxscan-selector",ARG_TYPE_ONEOF,-1,"MAXSCAN",NULL,NULL,CMD_ARG_OPTIONAL,2,NULL),.subargs=XGROUP_SETFILTER_maxscan_selector_Subargs},
+};
+
 /********** XGROUP SETID ********************/
 
 #ifndef SKIP_CMD_HISTORY_TABLE
@@ -12020,11 +12069,12 @@ struct COMMAND_ARG XGROUP_SETID_Args[] = {
 
 /* XGROUP command table */
 struct COMMAND_STRUCT XGROUP_Subcommands[] = {
-{MAKE_CMD("create","Creates a consumer group.","O(1)","5.0.0",CMD_DOC_NONE,NULL,NULL,"stream",COMMAND_GROUP_STREAM,XGROUP_CREATE_History,1,XGROUP_CREATE_Tips,0,xgroupCommand,-5,CMD_WRITE|CMD_DENYOOM,ACL_CATEGORY_STREAM,XGROUP_CREATE_Keyspecs,1,NULL,5),.args=XGROUP_CREATE_Args},
+{MAKE_CMD("create","Creates a consumer group.","O(1)","5.0.0",CMD_DOC_NONE,NULL,NULL,"stream",COMMAND_GROUP_STREAM,XGROUP_CREATE_History,2,XGROUP_CREATE_Tips,0,xgroupCommand,-5,CMD_WRITE|CMD_DENYOOM,ACL_CATEGORY_STREAM,XGROUP_CREATE_Keyspecs,1,NULL,7),.args=XGROUP_CREATE_Args},
 {MAKE_CMD("createconsumer","Creates a consumer in a consumer group.","O(1)","6.2.0",CMD_DOC_NONE,NULL,NULL,"stream",COMMAND_GROUP_STREAM,XGROUP_CREATECONSUMER_History,0,XGROUP_CREATECONSUMER_Tips,0,xgroupCommand,5,CMD_WRITE|CMD_DENYOOM,ACL_CATEGORY_STREAM,XGROUP_CREATECONSUMER_Keyspecs,1,NULL,3),.args=XGROUP_CREATECONSUMER_Args},
 {MAKE_CMD("delconsumer","Deletes a consumer from a consumer group.","O(1)","5.0.0",CMD_DOC_NONE,NULL,NULL,"stream",COMMAND_GROUP_STREAM,XGROUP_DELCONSUMER_History,0,XGROUP_DELCONSUMER_Tips,0,xgroupCommand,5,CMD_WRITE,ACL_CATEGORY_STREAM,XGROUP_DELCONSUMER_Keyspecs,1,NULL,3),.args=XGROUP_DELCONSUMER_Args},
 {MAKE_CMD("destroy","Destroys a consumer group.","O(N) where N is the number of entries in the group's pending entries list (PEL).","5.0.0",CMD_DOC_NONE,NULL,NULL,"stream",COMMAND_GROUP_STREAM,XGROUP_DESTROY_History,0,XGROUP_DESTROY_Tips,0,xgroupCommand,4,CMD_WRITE,ACL_CATEGORY_STREAM,XGROUP_DESTROY_Keyspecs,1,NULL,2),.args=XGROUP_DESTROY_Args},
 {MAKE_CMD("help","Returns helpful text about the different subcommands.","O(1)","5.0.0",CMD_DOC_NONE,NULL,NULL,"stream",COMMAND_GROUP_STREAM,XGROUP_HELP_History,0,XGROUP_HELP_Tips,0,xgroupCommand,2,CMD_LOADING|CMD_STALE,ACL_CATEGORY_STREAM,XGROUP_HELP_Keyspecs,0,NULL,0)},
+{MAKE_CMD("setfilter","Sets or removes the filter of a consumer group.","O(N) where N is the length of the expression.","8.14.0",CMD_DOC_NONE,NULL,NULL,"stream",COMMAND_GROUP_STREAM,XGROUP_SETFILTER_History,0,XGROUP_SETFILTER_Tips,0,xgroupCommand,-5,CMD_WRITE,ACL_CATEGORY_STREAM,XGROUP_SETFILTER_Keyspecs,1,NULL,4),.args=XGROUP_SETFILTER_Args},
 {MAKE_CMD("setid","Sets the last-delivered ID of a consumer group.","O(1)","5.0.0",CMD_DOC_NONE,NULL,NULL,"stream",COMMAND_GROUP_STREAM,XGROUP_SETID_History,1,XGROUP_SETID_Tips,0,xgroupCommand,-5,CMD_WRITE,ACL_CATEGORY_STREAM,XGROUP_SETID_Keyspecs,1,NULL,4),.args=XGROUP_SETID_Args},
 {0}
 };
@@ -12385,6 +12435,7 @@ struct COMMAND_ARG XREAD_Args[] = {
 commandHistory XREADGROUP_History[] = {
 {"8.4.0","Added the `CLAIM` option."},
 {"8.10.0","Added the `MAXCOUNT` and `MAXSIZE` options."},
+{"8.14.0","Added the `MAXSCAN` option."},
 };
 #endif
 
@@ -12418,6 +12469,7 @@ struct COMMAND_ARG XREADGROUP_Args[] = {
 {MAKE_ARG("count",ARG_TYPE_INTEGER,-1,"COUNT",NULL,NULL,CMD_ARG_OPTIONAL,0,NULL)},
 {MAKE_ARG("maxcount",ARG_TYPE_INTEGER,-1,"MAXCOUNT",NULL,"8.10.0",CMD_ARG_OPTIONAL,0,NULL)},
 {MAKE_ARG("maxsize",ARG_TYPE_INTEGER,-1,"MAXSIZE",NULL,"8.10.0",CMD_ARG_OPTIONAL,0,NULL)},
+{MAKE_ARG("maxscan",ARG_TYPE_INTEGER,-1,"MAXSCAN",NULL,"8.14.0",CMD_ARG_OPTIONAL,0,NULL)},
 {MAKE_ARG("milliseconds",ARG_TYPE_INTEGER,-1,"BLOCK",NULL,NULL,CMD_ARG_OPTIONAL,0,NULL)},
 {MAKE_ARG("min-idle-time",ARG_TYPE_INTEGER,-1,"CLAIM",NULL,"8.4.0",CMD_ARG_OPTIONAL,0,NULL)},
 {MAKE_ARG("noack",ARG_TYPE_PURE_TOKEN,-1,"NOACK",NULL,NULL,CMD_ARG_OPTIONAL,0,NULL)},
@@ -13676,7 +13728,7 @@ struct COMMAND_STRUCT redisCommandTable[] = {
 {MAKE_CMD("xpending","Returns the information and entries from a stream consumer group's pending entries list.","O(N) with N being the number of elements returned, so asking for a small fixed number of entries per call is O(1). O(M), where M is the total number of entries scanned when used with the IDLE filter. When the command returns just the summary and the list of consumers is small, it runs in O(1) time; otherwise, an additional O(N) time for iterating every consumer.","5.0.0",CMD_DOC_NONE,NULL,NULL,"stream",COMMAND_GROUP_STREAM,XPENDING_History,1,XPENDING_Tips,1,xpendingCommand,-3,CMD_READONLY,ACL_CATEGORY_STREAM,XPENDING_Keyspecs,1,NULL,3),.args=XPENDING_Args},
 {MAKE_CMD("xrange","Returns the messages from a stream within a range of IDs.","O(N) with N being the number of elements being returned. If N is constant (e.g. always asking for the first 10 elements with COUNT), you can consider it O(1).","5.0.0",CMD_DOC_NONE,NULL,NULL,"stream",COMMAND_GROUP_STREAM,XRANGE_History,1,XRANGE_Tips,0,xrangeCommand,-4,CMD_READONLY,ACL_CATEGORY_STREAM,XRANGE_Keyspecs,1,NULL,4),.args=XRANGE_Args},
 {MAKE_CMD("xread","Returns messages from multiple streams with IDs greater than the ones requested. Blocks until a message is available otherwise.",NULL,"5.0.0",CMD_DOC_NONE,NULL,NULL,"stream",COMMAND_GROUP_STREAM,XREAD_History,1,XREAD_Tips,0,xreadCommand,-4,CMD_BLOCKING|CMD_READONLY,ACL_CATEGORY_STREAM,XREAD_Keyspecs,1,xreadGetKeys,5),.args=XREAD_Args},
-{MAKE_CMD("xreadgroup","Returns new or historical messages from a stream for a consumer in a group. Blocks until a message is available otherwise.","For each stream mentioned: O(M) with M being the number of elements returned. If M is constant (e.g. always asking for the first 10 elements with COUNT), you can consider it O(1). On the other side when XREADGROUP blocks, XADD will pay the O(N) time in order to serve the N clients blocked on the stream getting new data.","5.0.0",CMD_DOC_NONE,NULL,NULL,"stream",COMMAND_GROUP_STREAM,XREADGROUP_History,2,XREADGROUP_Tips,0,xreadCommand,-7,CMD_BLOCKING|CMD_WRITE,ACL_CATEGORY_STREAM,XREADGROUP_Keyspecs,1,xreadGetKeys,8),.args=XREADGROUP_Args},
+{MAKE_CMD("xreadgroup","Returns new or historical messages from a stream for a consumer in a group. Blocks until a message is available otherwise.","For each stream mentioned: O(M) with M being the number of elements returned. If M is constant (e.g. always asking for the first 10 elements with COUNT), you can consider it O(1). On the other side when XREADGROUP blocks, XADD will pay the O(N) time in order to serve the N clients blocked on the stream getting new data.","5.0.0",CMD_DOC_NONE,NULL,NULL,"stream",COMMAND_GROUP_STREAM,XREADGROUP_History,3,XREADGROUP_Tips,0,xreadCommand,-7,CMD_BLOCKING|CMD_WRITE,ACL_CATEGORY_STREAM,XREADGROUP_Keyspecs,1,xreadGetKeys,9),.args=XREADGROUP_Args},
 {MAKE_CMD("xrevrange","Returns the messages from a stream within a range of IDs in reverse order.","O(N) with N being the number of elements returned. If N is constant (e.g. always asking for the first 10 elements with COUNT), you can consider it O(1).","5.0.0",CMD_DOC_NONE,NULL,NULL,"stream",COMMAND_GROUP_STREAM,XREVRANGE_History,1,XREVRANGE_Tips,0,xrevrangeCommand,-4,CMD_READONLY,ACL_CATEGORY_STREAM,XREVRANGE_Keyspecs,1,NULL,4),.args=XREVRANGE_Args},
 {MAKE_CMD("xsetid","An internal command for replicating stream values.","O(1)","5.0.0",CMD_DOC_NONE,NULL,NULL,"stream",COMMAND_GROUP_STREAM,XSETID_History,1,XSETID_Tips,0,xsetidCommand,-3,CMD_WRITE|CMD_DENYOOM|CMD_FAST,ACL_CATEGORY_STREAM,XSETID_Keyspecs,1,NULL,4),.args=XSETID_Args},
 {MAKE_CMD("xtrim","Deletes messages from the beginning of a stream.","O(N), with N being the number of evicted entries. Constant times are very small however, since entries are organized in macro nodes containing multiple entries that can be released with a single deallocation.","5.0.0",CMD_DOC_NONE,NULL,NULL,"stream",COMMAND_GROUP_STREAM,XTRIM_History,2,XTRIM_Tips,1,xtrimCommand,-4,CMD_WRITE,ACL_CATEGORY_STREAM,XTRIM_Keyspecs,1,NULL,2),.args=XTRIM_Args},

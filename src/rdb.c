@@ -19,6 +19,7 @@
 #include "endianconv.h"
 #include "fpconv_dtoa.h"
 #include "stream.h"
+#include "streamfilter.h"
 #include "functions.h"
 #include "intset.h"  /* Compact integer set structure */
 #include "bio.h"
@@ -752,7 +753,11 @@ int rdbSaveObjectType(rio *rdb, robj *o) {
         } else
             serverPanic("Unknown hash encoding");
     case OBJ_STREAM:
-        return rdbSaveType(rdb,RDB_TYPE_STREAM_LISTPACKS_5);
+        /* Only a stream whose groups carry filters needs the newer type, so
+         * every other stream stays loadable by servers without filters. */
+        return rdbSaveType(rdb,streamHasGroupFilters(o->ptr) ?
+                               RDB_TYPE_STREAM_LISTPACKS_6 :
+                               RDB_TYPE_STREAM_LISTPACKS_5);
 #ifdef ENABLE_GCRA
     case OBJ_GCRA:
         return rdbSaveType(rdb,RDB_TYPE_GCRA);
@@ -1610,6 +1615,8 @@ ssize_t rdbSaveObject(rio *rdb, robj *o, robj *key, int dbid) {
         size_t num_cgroups = s->cgroups ? raxSize(s->cgroups) : 0;
         if ((n = rdbSaveLen(rdb,num_cgroups)) == -1) return -1;
         nwritten += n;
+        /* RDB_TYPE_STREAM_LISTPACKS_6, see rdbSaveObjectType(). */
+        int save_filters = streamHasGroupFilters(s);
 
         if (num_cgroups) {
             /* Serialize each consumer group. */
@@ -1679,6 +1686,30 @@ ssize_t rdbSaveObject(rio *rdb, robj *o, robj *key, int dbid) {
                         if (nack == cg->pel_nack_tail) break;
                         nack = nack->pel_next;
                     }
+                }
+
+                /* Save the group's filter: its kind (0 none, 1 expression,
+                 * 2 ELSE), the expression, and the scan budget. */
+                if (save_filters) {
+                    streamFilter *f = cg->filter;
+                    uint64_t kind = f == NULL ? 0 : (f->is_else ? 2 : 1);
+                    if ((n = rdbSaveLen(rdb,kind)) == -1) {
+                        raxStop(&ri);
+                        return -1;
+                    }
+                    nwritten += n;
+                    if (kind == 1) {
+                        if ((n = rdbSaveRawString(rdb,(unsigned char*)f->source,sdslen(f->source))) == -1) {
+                            raxStop(&ri);
+                            return -1;
+                        }
+                        nwritten += n;
+                    }
+                    if ((n = rdbSaveLen(rdb,cg->maxscan)) == -1) {
+                        raxStop(&ri);
+                        return -1;
+                    }
+                    nwritten += n;
                 }
             }
             raxStop(&ri);
@@ -4129,7 +4160,8 @@ robj *rdbLoadObject(int rdbtype, rio *rdb, sds key, int dbid, int rdbver, int *e
                rdbtype == RDB_TYPE_STREAM_LISTPACKS_2 ||
                rdbtype == RDB_TYPE_STREAM_LISTPACKS_3 ||
                rdbtype == RDB_TYPE_STREAM_LISTPACKS_4 ||
-               rdbtype == RDB_TYPE_STREAM_LISTPACKS_5)
+               rdbtype == RDB_TYPE_STREAM_LISTPACKS_5 ||
+               rdbtype == RDB_TYPE_STREAM_LISTPACKS_6)
     {
         o = createStreamObject();
         stream *s = o->ptr;
@@ -4509,6 +4541,46 @@ robj *rdbLoadObject(int rdbtype, rio *rdb, sds key, int dbid, int rdbver, int *e
                     pelListInsertNacked(cgroup, nack);
                 }
 
+            }
+
+            /* For RDB_TYPE_STREAM_LISTPACKS_6, load the group's filter and
+             * scan budget. The expression is parsed again, as written. */
+            if (rdbtype == RDB_TYPE_STREAM_LISTPACKS_6) {
+                uint64_t kind = rdbLoadLen(rdb, NULL);
+                if (kind == RDB_LENERR || kind > 2) {
+                    rdbReportCorruptRDB("Stream cgroup filter kind is invalid");
+                    decrRefCount(o);
+                    return NULL;
+                }
+                streamFilter *filter = NULL;
+                if (kind == 1) {
+                    sds expr = rdbGenericLoadStringObject(rdb,RDB_LOAD_SDS,NULL);
+                    if (expr == NULL) {
+                        rdbReportReadError("Stream cgroup filter loading failed.");
+                        decrRefCount(o);
+                        return NULL;
+                    }
+                    sds err;
+                    filter = streamFilterParse(expr, sdslen(expr), &err);
+                    sdsfree(expr);
+                    if (filter == NULL) {
+                        rdbReportCorruptRDB("Stream cgroup filter does not parse: %s", err);
+                        sdsfree(err);
+                        decrRefCount(o);
+                        return NULL;
+                    }
+                } else if (kind == 2) {
+                    filter = streamFilterCreateElse();
+                }
+                uint64_t maxscan = rdbLoadLen(rdb, NULL);
+                if (maxscan == RDB_LENERR || maxscan > LLONG_MAX) {
+                    rdbReportCorruptRDB("Stream cgroup scan budget is invalid");
+                    streamFilterFree(filter);
+                    decrRefCount(o);
+                    return NULL;
+                }
+                streamCGSetFilter(s, cgroup, filter);
+                cgroup->maxscan = (long long)maxscan;
             }
 
             /* Verify entries outside the NACK zone all have a consumer

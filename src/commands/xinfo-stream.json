@@ -298,6 +298,21 @@
                                             }
                                         ]
                                     },
+                                    "filter": {
+                                        "description": "the group's filter expression, ELSE, or null; only for groups with a filter or a scan budget",
+                                        "oneOf": [
+                                            {
+                                                "type": "null"
+                                            },
+                                            {
+                                                "type": "string"
+                                            }
+                                        ]
+                                    },
+                                    "maxscan": {
+                                        "description": "entries a filtered read examines at most; only for groups with a filter or a scan budget",
+                                        "type": "integer"
+                                    },
                                     "pel-count": {
                                         "description": "total number of unacknowledged entries",
                                         "type": "integer"

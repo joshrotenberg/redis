@@ -101,6 +101,7 @@ char *rdb_type_string[] = {
 #else
     "unused",
 #endif
+    "stream-v6",
 };
 
 /* Show a few stats collected into 'rdbstate' */

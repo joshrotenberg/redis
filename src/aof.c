@@ -13,6 +13,7 @@
 #include "functions.h"
 #include "cluster_asm.h"
 #include "zset_btree.h"
+#include "streamfilter.h"
 
 #include <signal.h>
 #include <fcntl.h>
@@ -2763,15 +2764,28 @@ int rewriteStreamObject(rio *r, robj *key, robj *o) {
         raxSeek(&ri,"^",NULL,0);
         while(raxNext(&ri)) {
             streamCG *group = ri.data;
-            /* Emit the XGROUP CREATE in order to create the group. */
-            if (!rioWriteBulkCount(r,'*',7) ||
+            streamFilter *filter = group->filter;
+            /* Emit the XGROUP CREATE in order to create the group, with its
+             * filter (FILTER <expr> or ELSE) and scan budget when it has them. */
+            long argc = 7;
+            if (filter) argc += filter->is_else ? 1 : 2;
+            if (group->maxscan) argc += 2;
+            if (!rioWriteBulkCount(r,'*',argc) ||
                 !rioWriteBulkString(r,"XGROUP",6) ||
                 !rioWriteBulkString(r,"CREATE",6) ||
                 !rioWriteBulkObject(r,key) ||
                 !rioWriteBulkString(r,(char*)ri.key,ri.key_len) ||
                 !rioWriteBulkStreamID(r,&group->last_id) ||
                 !rioWriteBulkString(r,"ENTRIESREAD",11) ||
-                !rioWriteBulkLongLong(r,group->entries_read))
+                !rioWriteBulkLongLong(r,group->entries_read) ||
+                (filter && filter->is_else &&
+                 !rioWriteBulkString(r,"ELSE",4)) ||
+                (filter && !filter->is_else &&
+                 (!rioWriteBulkString(r,"FILTER",6) ||
+                  !rioWriteBulkString(r,filter->source,sdslen(filter->source)))) ||
+                (group->maxscan &&
+                 (!rioWriteBulkString(r,"MAXSCAN",7) ||
+                  !rioWriteBulkLongLong(r,group->maxscan))))
             {
                 raxStop(&ri);
                 return 0;

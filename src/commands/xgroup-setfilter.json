@@ -1,0 +1,88 @@
+{
+    "SETFILTER": {
+        "summary": "Sets or removes the filter of a consumer group.",
+        "complexity": "O(N) where N is the length of the expression.",
+        "group": "stream",
+        "since": "8.14.0",
+        "arity": -5,
+        "container": "XGROUP",
+        "function": "xgroupCommand",
+        "command_flags": [
+            "WRITE"
+        ],
+        "acl_categories": [
+            "STREAM"
+        ],
+        "key_specs": [
+            {
+                "flags": [
+                    "RW",
+                    "UPDATE"
+                ],
+                "begin_search": {
+                    "index": {
+                        "pos": 2
+                    }
+                },
+                "find_keys": {
+                    "range": {
+                        "lastkey": 0,
+                        "step": 1,
+                        "limit": 0
+                    }
+                }
+            }
+        ],
+        "arguments": [
+            {
+                "name": "key",
+                "type": "key",
+                "key_spec_index": 0
+            },
+            {
+                "name": "group",
+                "type": "string"
+            },
+            {
+                "name": "filter-selector",
+                "type": "oneof",
+                "arguments": [
+                    {
+                        "name": "expression",
+                        "type": "string"
+                    },
+                    {
+                        "name": "else",
+                        "type": "pure-token",
+                        "token": "ELSE"
+                    },
+                    {
+                        "name": "none",
+                        "type": "pure-token",
+                        "token": "NONE"
+                    }
+                ]
+            },
+            {
+                "name": "maxscan-selector",
+                "token": "MAXSCAN",
+                "type": "oneof",
+                "optional": true,
+                "arguments": [
+                    {
+                        "name": "maxscan",
+                        "type": "integer"
+                    },
+                    {
+                        "name": "default",
+                        "type": "pure-token",
+                        "token": "DEFAULT"
+                    }
+                ]
+            }
+        ],
+        "reply_schema": {
+            "const": "OK"
+        }
+    }
+}

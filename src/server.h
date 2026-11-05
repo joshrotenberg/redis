@@ -2722,6 +2722,8 @@ struct redisServer {
     size_t hll_sparse_max_bytes;
     size_t stream_node_max_bytes;
     long long stream_node_max_entries;
+    long long stream_filter_max_scan;   /* Default per-stream scan budget of a
+                                           filtered consumer group read. */
     /* Stream IDMP parameters */
     long long stream_idmp_duration;     /* Default IDMP duration in seconds. */
     long long stream_idmp_maxsize;      /* Default IDMP max entries. */

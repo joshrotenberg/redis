@@ -11,6 +11,10 @@
             [
                 "7.0.0",
                 "Added the `entries_read` named argument."
+            ],
+            [
+                "8.14.0",
+                "Added the `FILTER`, `ELSE` and `MAXSCAN` options."
             ]
         ],
         "command_flags": [
@@ -77,6 +81,31 @@
                 "token": "ENTRIESREAD",
                 "type": "integer",
                 "optional": true
+            },
+            {
+                "name": "filter-selector",
+                "type": "oneof",
+                "optional": true,
+                "since": "8.14.0",
+                "arguments": [
+                    {
+                        "name": "expression",
+                        "token": "FILTER",
+                        "type": "string"
+                    },
+                    {
+                        "name": "else",
+                        "type": "pure-token",
+                        "token": "ELSE"
+                    }
+                ]
+            },
+            {
+                "name": "maxscan",
+                "token": "MAXSCAN",
+                "type": "integer",
+                "optional": true,
+                "since": "8.14.0"
             }
         ],
         "reply_schema": {
