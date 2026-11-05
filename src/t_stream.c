@@ -96,6 +96,7 @@ stream *streamNew(void) {
     s->iids_duplicates = 0;
     s->distrib_epoch = STREAM_DISTRIB_NEVER_COUNTED;
     s->distrib_counted = 0;
+    s->filter_epoch = 0;
     return s;
 }
 
@@ -2457,6 +2458,89 @@ static int streamFilterSkip(stream *s, streamCG *group, long long budget, long l
     return res;
 }
 
+/* Would running a blocked read of the filtered group 'cg' again serve it,
+ * given its scan budget? streamFilterSkip() serves it when an entry the group
+ * takes follows the cursor within the budget, or when more than 'budget'
+ * entries follow it, so the check wakes the reader when any unchecked entry
+ * matches, or when the entries after the cursor outnumber the budget.
+ * Checked entries are remembered on the group (streamCG.wake_*), so each new
+ * entry is checked once for all of the group's blocked readers, and a reader
+ * that is not served stays blocked without moving the cursor. New entries are
+ * read backward from the end of the stream: a forward iterator would decode
+ * every entry of the last node before reaching them. */
+static int streamFilterWakeCheck(stream *s, streamCG *cg, long long budget) {
+    if (cg->wake_epoch != s->filter_epoch ||
+        streamCompareID(&cg->wake_from, &cg->last_id) != 0)
+    {
+        cg->wake_from = cg->last_id;
+        cg->wake_id = cg->last_id;
+        cg->wake_count = 0;
+        cg->wake_epoch = s->filter_epoch;
+    }
+    if (cg->wake_count > budget) return 1;
+    if (streamCompareID(&cg->wake_id, &s->last_id) >= 0) return 0;
+
+    streamIterator si;
+    streamID start = cg->wake_id, id;
+    int64_t numfields;
+    long long fresh = 0;
+    int wake = 0;
+    streamIncrID(&start); /* Cannot overflow: wake_id < last_id. */
+    streamIteratorStart(&si, s, &start, NULL, 1);
+    while (streamIteratorGetID(&si, &id, &numfields)) {
+        if (streamCGMatchEntry(s, cg, &si, numfields)) {
+            wake = 1;
+            break;
+        }
+        streamIteratorSkipFields(&si, numfields);
+        fresh++;
+    }
+    streamIteratorStop(&si);
+    if (!wake && cg->wake_count + fresh > budget) wake = 1;
+    if (!wake) {
+        /* Every entry up to the stream's last ID is now checked. */
+        cg->wake_id = s->last_id;
+        cg->wake_count += fresh;
+    }
+    return wake;
+}
+
+/* Called before a client blocked in XREAD or XREADGROUP runs its command
+ * again because one of its keys, holding the stream 's', got new data.
+ * Returns 0 when the command would only block again: an XREADGROUP of a
+ * filtered group with nothing new the group takes. Returns 1 for everything
+ * else, including XREAD, the CLAIM option, a group that no longer exists
+ * (the read replies -NOGROUP) and a group without a filter. */
+int streamBlockedReadShouldWake(client *c, stream *s) {
+    if (c->cmd->proc != xreadCommand || sdslen(c->argv[0]->ptr) != 10) return 1;
+
+    /* The arguments were checked when the command blocked. */
+    robj *groupname = NULL;
+    long long maxscan = 0;
+    for (int i = 1; i < c->argc; i++) {
+        char *o = c->argv[i]->ptr;
+        if (!strcasecmp(o,"STREAMS")) {
+            break;
+        } else if (!strcasecmp(o,"GROUP")) {
+            groupname = c->argv[i+1];
+            i += 2;
+        } else if (!strcasecmp(o,"CLAIM")) {
+            return 1; /* Pending entries can become claimable as well. */
+        } else if (!strcasecmp(o,"MAXSCAN")) {
+            if (getLongLongFromObject(c->argv[++i], &maxscan) != C_OK) return 1;
+        } else if (strcasecmp(o,"NOACK")) {
+            i++; /* BLOCK, COUNT, MAXCOUNT and MAXSIZE take a value. */
+        }
+    }
+    if (groupname == NULL || s->cgroups == NULL) return 1;
+    streamCG *cg = streamLookupCG(s, groupname->ptr);
+    if (cg == NULL || cg->filter == NULL) return 1;
+    long long budget = maxscan ? maxscan :
+                       cg->maxscan ? cg->maxscan :
+                       server.stream_filter_max_scan;
+    return streamFilterWakeCheck(s, cg, budget);
+}
+
 #define STREAM_RWR_NOACK (1<<0)         /* Do not create entries in the PEL. */
 #define STREAM_RWR_RAWENTRIES (1<<1)    /* Do not emit protocol for array
                                            boundaries, just the entries. */
@@ -3936,6 +4020,10 @@ streamCG *streamCreateCG(stream *s, char *name, size_t namelen, streamID *id, lo
     cg->entries_read = entries_read;
     cg->filter = NULL;
     cg->maxscan = 0;
+    cg->wake_from = cg->last_id;
+    cg->wake_id = cg->last_id;
+    cg->wake_count = 0;
+    cg->wake_epoch = s->filter_epoch;
     streamDistribStamp *st = (streamDistribStamp *) cg->pel->metadata;
     st->epoch = STREAM_DISTRIB_NEVER_COUNTED;
     st->counted = 0;
@@ -3968,6 +4056,9 @@ void streamCGSetFilter(stream *s, streamCG *cg, streamFilter *f) {
     }
     cg->filter = f;
     if (f) s->alloc_size += f->alloc_size;
+    /* What an ELSE group takes depends on every other group's filter, so a
+     * change to any of them voids what blocked readers know (streamCG.wake_*). */
+    s->filter_epoch++;
 }
 
 /* Does any group of the stream have a filter or a scan budget? */
@@ -4329,6 +4420,9 @@ NULL
         server.dirty++;
         notifyKeyspaceEvent(NOTIFY_STREAM,"xgroup-setfilter",c->argv[2],c->db->id);
         keyModified(c,c->db,c->argv[2],o,0);
+        /* Blocked readers check the entries after the cursor again under
+         * the new filter. */
+        signalKeyAsReady(c->db,c->argv[2],OBJ_STREAM);
     } else if (!strcasecmp(opt,"SETID") && (c->argc == 5 || c->argc == 7)) {
         streamID id;
         if (!strcmp(c->argv[4]->ptr,"$")) {

@@ -661,6 +661,11 @@ static void handleClientsBlockedOnKey(readyList *rl) {
                 (receiver->bstate.btype == obtype ||
                  (obtype == BLOCKED_LIST &&
                   receiver->bstate.btype == BLOCKED_LIST_NONEMPTY));
+            /* 5. A blocked XREADGROUP of a filtered group stays blocked when
+             *    the group takes none of the new entries. */
+            if (native_match && obtype == BLOCKED_STREAM &&
+                !streamBlockedReadShouldWake(receiver, o->ptr))
+                continue;
             if (native_match ||
                 (o != NULL && (receiver->bstate.btype == BLOCKED_MODULE)) ||
                 (receiver->bstate.unblock_on_nokey))

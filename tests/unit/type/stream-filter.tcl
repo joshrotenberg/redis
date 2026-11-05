@@ -242,11 +242,119 @@ start_server {
         $rd XREADGROUP GROUP big c BLOCK 0 STREAMS s >
         wait_for_blocked_clients_count 1
         r XADD s 1-1 px 5
-        # Still blocked: the entry didn't match, and the cursor moved past it.
+        # Still blocked, and the read did not run again: it would have moved
+        # the cursor past the entry.
         assert_equal 1 [s blocked_clients]
-        assert_equal 1-1 [dict get [filter_group s big] last-delivered-id]
+        assert_equal 0-0 [dict get [filter_group s big] last-delivered-id]
         r XADD s 1-2 px 500
         assert_equal {{s {{1-2 {px 500}}}}} [$rd read]
+        assert_equal 1-2 [dict get [filter_group s big] last-delivered-id]
+        $rd close
+    }
+
+    test {One matching entry wakes one of a filtered group's blocked readers} {
+        r DEL s
+        r XGROUP CREATE s big $ MKSTREAM FILTER {px > 200}
+        set rd1 [redis_deferring_client]
+        set rd2 [redis_deferring_client]
+        $rd1 XREADGROUP GROUP big c1 BLOCK 0 STREAMS s >
+        $rd2 XREADGROUP GROUP big c2 BLOCK 0 STREAMS s >
+        wait_for_blocked_clients_count 2
+        r XADD s 1-1 px 5
+        assert_equal 2 [s blocked_clients]
+        r XADD s 1-2 px 500
+        assert_equal {{s {{1-2 {px 500}}}}} [$rd1 read]
+        assert_equal 1 [s blocked_clients]
+        r XADD s 1-3 px 600
+        assert_equal {{s {{1-3 {px 600}}}}} [$rd2 read]
+        $rd1 close
+        $rd2 close
+    }
+
+    test {A blocked filtered read returns an empty entry list once its scan budget runs out} {
+        r DEL s
+        r XGROUP CREATE s big $ MKSTREAM FILTER {px > 200}
+        set rd [redis_deferring_client]
+        $rd XREADGROUP GROUP big c MAXSCAN 3 BLOCK 0 STREAMS s >
+        wait_for_blocked_clients_count 1
+        # Three entries fit the budget; the fourth is one more than it allows.
+        for {set j 1} {$j <= 3} {incr j} {r XADD s 1-$j px 5}
+        assert_equal 1 [s blocked_clients]
+        r XADD s 1-4 px 5
+        assert_equal {{s {}}} [$rd read]
+        assert_equal 1-3 [dict get [filter_group s big] last-delivered-id]
+        $rd close
+    }
+
+    test {A blocked filtered read checks every entry added at once, across listpack nodes} {
+        r DEL s
+        set node_max [lindex [r CONFIG GET stream-node-max-entries] 1]
+        r CONFIG SET stream-node-max-entries 2
+        r XGROUP CREATE s big $ MKSTREAM FILTER {px > 200}
+        set rd [redis_deferring_client]
+        $rd XREADGROUP GROUP big c BLOCK 0 STREAMS s >
+        wait_for_blocked_clients_count 1
+        r MULTI
+        for {set j 1} {$j <= 5} {incr j} {r XADD s 1-$j px 5}
+        r EXEC
+        assert_equal 1 [s blocked_clients]
+        r MULTI
+        r XADD s 1-6 px 500
+        for {set j 7} {$j <= 11} {incr j} {r XADD s 1-$j px 5}
+        r EXEC
+        assert_equal {{s {{1-6 {px 500}}}}} [$rd read]
+        $rd close
+        r CONFIG SET stream-node-max-entries $node_max
+    }
+
+    test {A blocked ELSE reader wakes only for entries no filtered group takes} {
+        r DEL s
+        r XGROUP CREATE s hi $ MKSTREAM FILTER {px > 200}
+        r XGROUP CREATE s rest $ ELSE
+        set rd [redis_deferring_client]
+        $rd XREADGROUP GROUP rest c BLOCK 0 STREAMS s >
+        wait_for_blocked_clients_count 1
+        r XADD s 1-1 px 500
+        assert_equal 1 [s blocked_clients]
+        r XADD s 1-2 px 5
+        assert_equal {{s {{1-2 {px 5}}}}} [$rd read]
+        $rd close
+    }
+
+    test {XGROUP SETFILTER wakes a blocked reader that the new filter serves} {
+        r DEL s
+        r XGROUP CREATE s big $ MKSTREAM FILTER {px > 200}
+        set rd [redis_deferring_client]
+        $rd XREADGROUP GROUP big c BLOCK 0 STREAMS s >
+        wait_for_blocked_clients_count 1
+        r XADD s 1-1 px 5
+        assert_equal 1 [s blocked_clients]
+        r XGROUP SETFILTER s big {px < 10}
+        assert_equal {{s {{1-1 {px 5}}}}} [$rd read]
+        $rd close
+    }
+
+    test {XGROUP SETID while a filtered reader is blocked: the next entry checks from the new cursor} {
+        r DEL s
+        r XADD s 1-1 px 500
+        r XGROUP CREATE s big $ FILTER {px > 200}
+        set rd [redis_deferring_client]
+        $rd XREADGROUP GROUP big c BLOCK 0 STREAMS s >
+        wait_for_blocked_clients_count 1
+        r XGROUP SETID s big 0
+        r XADD s 1-2 px 5
+        assert_equal {{s {{1-1 {px 500}}}}} [$rd read]
+        $rd close
+    }
+
+    test {XGROUP DESTROY unblocks a filtered group's reader with NOGROUP} {
+        r DEL s
+        r XGROUP CREATE s big $ MKSTREAM FILTER {px > 200}
+        set rd [redis_deferring_client]
+        $rd XREADGROUP GROUP big c BLOCK 0 STREAMS s >
+        wait_for_blocked_clients_count 1
+        r XGROUP DESTROY s big
+        assert_error "*NOGROUP*" {$rd read}
         $rd close
     }
 
@@ -256,7 +364,8 @@ start_server {
         set rd [redis_deferring_client]
         $rd XREADGROUP GROUP big c BLOCK 400 STREAMS s >
         wait_for_blocked_clients_count 1
-        # Entries that don't match re-run the read; none may restart its timeout.
+        # Entries that don't match leave the read blocked; none may restart
+        # its timeout.
         for {set j 0} {$j < 10} {incr j} {
             r XADD s * px 1
             after 70

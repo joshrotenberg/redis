@@ -56,6 +56,8 @@ typedef struct stream {
     rax *idmp_producers;   /* IDMP producers radix tree: pid -> idmpProducer */
     uint64_t iids_added;   /* All time count of entries with IID added. */
     uint64_t iids_duplicates; /* All time count of duplicate IIDs detected. */
+    uint32_t filter_epoch;  /* Bumped whenever a group filter changes; see
+                               streamCG.wake_epoch. */
 } stream;
 
 /* We define an iterator to iterate stream items in an abstract way, without
@@ -128,6 +130,15 @@ typedef struct streamCG {
                                     NULL for all of them (streamfilter.h). */
     long long maxscan;      /* Entries a filtered read examines at most per
                                stream, 0 for stream-filter-max-scan. */
+    /* What blocked readers of a filtered group already know, so a new entry
+     * the group does not take wakes none of them. Entries in
+     * (wake_from, wake_id] were checked and the group takes none of them;
+     * wake_count is how many there are. Valid while last_id == wake_from and
+     * wake_epoch == stream.filter_epoch. Not persisted or replicated. */
+    streamID wake_from;
+    streamID wake_id;
+    long long wake_count;
+    uint32_t wake_epoch;
 } streamCG;
 
 /* A specific consumer in a consumer group.  */
@@ -218,6 +229,7 @@ streamCG *streamCreateCG(stream *s, char *name, size_t namelen, streamID *id, lo
 void streamCGSetFilter(stream *s, streamCG *cg, struct streamFilter *f);
 streamCG *streamLookupElseCG(stream *s, streamCG *except);
 int streamHasGroupFilters(stream *s);
+int streamBlockedReadShouldWake(struct client *c, stream *s);
 streamNACK *streamCreateNACK(stream *s, streamConsumer *consumer, streamID *id);
 void streamEncodeID(void *buf, streamID *id);
 void streamDecodeID(void *buf, streamID *id);
