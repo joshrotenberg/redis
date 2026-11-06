@@ -393,6 +393,41 @@ start_server {
         $rd close
     }
 
+    test {A woken filtered read skips what its wakeup check passed over, keeping entries-read} {
+        r DEL s
+        r XGROUP CREATE s big $ MKSTREAM FILTER {px > 200}
+        set rd [redis_deferring_client]
+        # Each XADD runs the wakeup check on one entry; the read that the
+        # match wakes moves the cursor past the five without reading them.
+        $rd XREADGROUP GROUP big c BLOCK 0 STREAMS s >
+        wait_for_blocked_clients_count 1
+        for {set j 1} {$j <= 5} {incr j} {r XADD s 1-$j px 5}
+        r XADD s 1-6 px 500
+        assert_equal {{s {{1-6 {px 500}}}}} [$rd read]
+        set g [filter_group s big]
+        assert_equal {1-6 6 0} [list [dict get $g last-delivered-id] [dict get $g entries-read] [dict get $g lag]]
+        # An entry deleted from the checked range.
+        $rd XREADGROUP GROUP big c BLOCK 0 STREAMS s >
+        wait_for_blocked_clients_count 1
+        for {set j 1} {$j <= 3} {incr j} {r XADD s 2-$j px 5}
+        r XDEL s 2-2
+        r XADD s 2-4 px 500
+        assert_equal {{s {{2-4 {px 500}}}}} [$rd read]
+        set g [filter_group s big]
+        assert_equal {2-4 10 0} [list [dict get $g last-delivered-id] [dict get $g entries-read] [dict get $g lag]]
+        # The checked range trimmed away.
+        $rd XREADGROUP GROUP big c BLOCK 0 STREAMS s >
+        wait_for_blocked_clients_count 1
+        r XADD s 3-1 px 5
+        r XADD s 3-2 px 5
+        r XTRIM s MINID 3-2
+        r XADD s 3-3 px 500
+        assert_equal {{s {{3-3 {px 500}}}}} [$rd read]
+        set g [filter_group s big]
+        assert_equal {3-3 13 0} [list [dict get $g last-delivered-id] [dict get $g entries-read] [dict get $g lag]]
+        $rd close
+    }
+
     test {A blocked filtered read checks every entry added at once, across listpack nodes} {
         r DEL s
         set node_max [lindex [r CONFIG GET stream-node-max-entries] 1]

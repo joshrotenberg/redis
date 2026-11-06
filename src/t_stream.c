@@ -2464,9 +2464,9 @@ static int streamCGMatchEntry(stream *s, streamCG *cg, streamIterator *si, int64
     return !taken;
 }
 
-/* Move the group's last delivered ID forward to 'id', keeping entries_read
- * in step. Returns 1 if the ID moved. */
-static int streamCGAdvance(stream *s, streamCG *group, streamID *id) {
+/* Move the group's last delivered ID forward to 'id', past 'n' entries,
+ * keeping entries_read in step. Returns 1 if the ID moved. */
+static int streamCGAdvanceBy(stream *s, streamCG *group, streamID *id, long long n) {
     if (streamCompareID(id, &group->last_id) <= 0) return 0;
     if (group->entries_read != SCG_INVALID_ENTRIES_READ &&
         streamCompareID(&group->last_id, &s->first_id) >= 0 &&
@@ -2475,7 +2475,7 @@ static int streamCGAdvance(stream *s, streamCG *group, streamID *id) {
         /* A valid counter and no tombstones between the group's last-delivered-id
          * and the stream's last-generated-id mean we can increment the read counter
          * to keep tracking the group's progress. */
-        group->entries_read++;
+        group->entries_read += n;
     } else if (s->entries_added) {
         /* The group's counter may be invalid, so we try to obtain it. */
         group->entries_read = streamEstimateDistanceFromFirstEverEntry(s, id);
@@ -2484,7 +2484,11 @@ static int streamCGAdvance(stream *s, streamCG *group, streamID *id) {
     return 1;
 }
 
-#define STREAM_FILTER_SKIP_END 0        /* No match up to the end of the stream. */
+static inline int streamCGAdvance(stream *s, streamCG *group, streamID *id) {
+    return streamCGAdvanceBy(s, group, id, 1);
+}
+
+#define STREAM_FILTER_SKIP_END 0       /* No match up to the end of the stream. */
 #define STREAM_FILTER_SKIP_MATCH 1      /* The entry after the cursor matches. */
 #define STREAM_FILTER_SKIP_BUDGET 2     /* The scan budget ran out first. */
 
@@ -2494,11 +2498,23 @@ static int streamCGAdvance(stream *s, streamCG *group, streamID *id) {
  * number of entries skipped. */
 static int streamFilterSkip(stream *s, streamCG *group, long long budget, long long *examined) {
     streamIterator si;
-    streamID start = group->last_id, id;
+    streamID start, id;
     int64_t numfields;
     int res = STREAM_FILTER_SKIP_END;
 
     *examined = 0;
+    /* Entries the wakeup check of a blocked read already found the group
+     * does not take (streamCG.wake_*) are skipped without a second look,
+     * when they fit in the budget. */
+    if (group->wake_epoch == s->filter_epoch &&
+        streamCompareID(&group->wake_from, &group->last_id) == 0 &&
+        streamCompareID(&group->wake_id, &group->last_id) > 0 &&
+        group->wake_count <= budget)
+    {
+        streamCGAdvanceBy(s, group, &group->wake_id, group->wake_count);
+        *examined = group->wake_count;
+    }
+    start = group->last_id;
     if (streamIncrID(&start) != C_OK) return res;
     streamFilterReads++;
     streamIteratorStart(&si, s, &start, NULL, 0);
