@@ -742,6 +742,56 @@ void streamFilterFree(streamFilter *f) {
     zfree(f);
 }
 
+/* Active defrag. 'defragfn' returns the new address of an allocation it moved,
+ * having freed the old one, or NULL when it left it in place. */
+typedef void *(*sfDefragFn)(void *ptr);
+
+static sds sfDefragSds(sds s, sfDefragFn defragfn) {
+    void *ptr = sdsAllocPtr(s);
+    void *newptr = defragfn(ptr);
+    return newptr ? (sds)((char *)newptr + ((char *)s - (char *)ptr)) : NULL;
+}
+
+#define SF_DEFRAG(lvalue, fn) do { \
+    void *_moved = (fn); \
+    if (_moved) (lvalue) = _moved; \
+} while (0)
+
+static void *sfNodeDefrag(sfNode *n, sfDefragFn defragfn) {
+    sfNode *moved = defragfn(n);
+    if (moved) n = moved;
+    if (n->children) SF_DEFRAG(n->children, defragfn(n->children));
+    for (int j = 0; j < n->nchildren; j++)
+        SF_DEFRAG(n->children[j], sfNodeDefrag(n->children[j], defragfn));
+    if (n->value.text) SF_DEFRAG(n->value.text, sfDefragSds(n->value.text, defragfn));
+    if (n->set) {
+        SF_DEFRAG(n->set, defragfn(n->set));
+        sfInSet *set = n->set;
+        if (set->strs) SF_DEFRAG(set->strs, defragfn(set->strs));
+        for (size_t j = 0; j < set->nstrs; j++)
+            SF_DEFRAG(set->strs[j], sfDefragSds(set->strs[j], defragfn));
+        if (set->ints) SF_DEFRAG(set->ints, defragfn(set->ints));
+        if (set->nums) SF_DEFRAG(set->nums, defragfn(set->nums));
+        if (set->nonints) SF_DEFRAG(set->nonints, defragfn(set->nonints));
+    }
+    return moved;
+}
+
+/* Moves the same allocations sfComputeAllocSize() counts. Moving keeps each
+ * allocation's usable size, so f->alloc_size stays correct. */
+streamFilter *streamFilterDefrag(streamFilter *f, void *(*defragfn)(void *ptr)) {
+    streamFilter *moved = defragfn(f);
+    if (moved) f = moved;
+    SF_DEFRAG(f->source, sfDefragSds(f->source, defragfn));
+    if (f->fields) SF_DEFRAG(f->fields, defragfn(f->fields));
+    for (int j = 0; j < f->nfields; j++)
+        SF_DEFRAG(f->fields[j], sfDefragSds(f->fields[j], defragfn));
+    if (f->root) SF_DEFRAG(f->root, sfNodeDefrag(f->root, defragfn));
+    if (f->pos_field) SF_DEFRAG(f->pos_field, defragfn(f->pos_field));
+    if (f->pos_index) SF_DEFRAG(f->pos_index, defragfn(f->pos_index));
+    return moved;
+}
+
 /* ---------------------------------------------------------------------------
  * Evaluation
  * ------------------------------------------------------------------------- */

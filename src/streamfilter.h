@@ -63,6 +63,11 @@ streamFilter *streamFilterCreateElse(void);
 streamFilter *streamFilterDup(const streamFilter *f);
 void streamFilterFree(streamFilter *f);
 
+/* Active defrag: moves every allocation the filter owns with 'defragfn', which
+ * returns the new address of an allocation it moved (having freed the old
+ * one) or NULL. Returns the filter's new address, or NULL if it stayed. */
+streamFilter *streamFilterDefrag(streamFilter *f, void *(*defragfn)(void *ptr));
+
 /* Evaluate against one entry. 'vals[i]' and 'lens[i]' hold the value of
  * f->fields[i] in the entry, or vals[i] == NULL when the entry lacks it.
  * Returns 1 on a match. Not valid for an ELSE filter. */

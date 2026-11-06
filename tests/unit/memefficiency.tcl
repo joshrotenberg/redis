@@ -852,6 +852,117 @@ run_solo {defrag} {
             }
         }
 
+        test "Active defrag stream group filters: $type" {
+            r flushdb
+            r config set hz 100
+            r config set activedefrag no
+            wait_for_defrag_stop 500 100
+            r config resetstat
+            r config set active-defrag-threshold-lower 5
+            r config set active-defrag-cycle-min 65
+            r config set active-defrag-cycle-max 75
+            r config set active-defrag-ignore-bytes 1500kb
+            r config set maxmemory 0
+
+            # Each group's filter holds 9 IN members of 387 bytes. Interleave
+            # them with string keys of the same size, then delete the keys.
+            set n 2000
+            set dummy [string repeat x 380]
+            r xadd s * tag none
+            set rd [redis_deferring_client]
+            for {set j 0} {$j < $n} {incr j} {
+                set members {}
+                for {set m 0} {$m < 9} {incr m} {
+                    lappend members "\"$dummy[format %05d $j]-$m\""
+                }
+                set expr($j) "tag IN ([join $members ,])"
+                $rd xgroup create s g$j $ FILTER $expr($j)
+                for {set m 0} {$m < 9} {incr m} {
+                    $rd set k$j-$m "$dummy[format %05d $j]-$m"
+                }
+                for {set i 0} {$i < 10} {incr i} { $rd read }
+            }
+            r xgroup create s rest $ ELSE
+
+            after 120 ;# serverCron only updates the info once in 100ms
+            if {$::verbose} {
+                puts "used [s allocator_allocated]"
+                puts "rss [s allocator_active]"
+                puts "frag [s allocator_frag_ratio]"
+                puts "frag_bytes [s allocator_frag_bytes]"
+            }
+            assert_lessthan [s allocator_frag_ratio] 1.05
+
+            for {set j 0} {$j < $n} {incr j} {
+                for {set m 0} {$m < 9} {incr m} { $rd del k$j-$m }
+            }
+            for {set j 0} {$j < [expr {$n * 9}]} {incr j} { $rd read }
+            if {$type eq "cluster"} {
+                $rd config resetstat
+                $rd read ; # Discard config resetstat reply
+            }
+            $rd close
+            after 120 ;# serverCron only updates the info once in 100ms
+            if {$::verbose} {
+                puts "used [s allocator_allocated]"
+                puts "rss [s allocator_active]"
+                puts "frag [s allocator_frag_ratio]"
+                puts "frag_bytes [s allocator_frag_bytes]"
+            }
+            assert_morethan [s allocator_frag_ratio] 1.35
+
+            catch {r config set activedefrag yes} e
+            if {[r config get activedefrag] eq "activedefrag yes"} {
+                # wait for the active defrag to start working (decision once a second)
+                wait_for_condition 50 100 {
+                    [s total_active_defrag_time] ne 0
+                } else {
+                    after 120 ;# serverCron only updates the info once in 100ms
+                    puts [r info memory]
+                    puts [r info stats]
+                    puts [r memory malloc-stats]
+                    fail "defrag not started."
+                }
+
+                # wait for the active defrag to stop working
+                wait_for_defrag_stop 500 100 1.1
+
+                after 120 ;# serverCron only updates the info once in 100ms
+                if {$::verbose} {
+                    puts "used [s allocator_allocated]"
+                    puts "rss [s allocator_active]"
+                    puts "frag [s allocator_frag_ratio]"
+                    puts "frag_bytes [s allocator_frag_bytes]"
+                }
+
+                # Every filter reads back as created.
+                set seen 0
+                foreach g [r xinfo groups s] {
+                    set name [dict get $g name]
+                    if {$name eq "rest"} {
+                        assert_equal ELSE [dict get $g filter]
+                    } else {
+                        assert_equal $expr([string range $name 1 end]) [dict get $g filter]
+                    }
+                    incr seen
+                }
+                assert_equal [expr {$n + 1}] $seen
+
+                # Each filter still matches its own members and no others.
+                foreach j [list 0 [expr {$n / 2}] [expr {$n - 1}]] {
+                    set id [r xadd s * tag "$dummy[format %05d $j]-4"]
+                    set other [expr {($j + 1) % $n}]
+                    assert_equal [list [list s [list [list $id [list tag "$dummy[format %05d $j]-4"]]]]] \
+                        [r xreadgroup GROUP g$j c STREAMS s >]
+                    assert_equal {} [r xreadgroup GROUP g$other c STREAMS s >]
+                    assert_equal {} [r xreadgroup GROUP rest c STREAMS s >]
+                }
+                set id [r xadd s * tag nobody]
+                assert_equal [list [list s [list [list $id {tag nobody}]]]] \
+                    [r xreadgroup GROUP rest c STREAMS s >]
+            }
+        }
+
         foreach {eb_container fields n} {eblist 16 3000 ebrax 30 1600 large_ebrax 500 100} {
         test "Active Defrag HFE with $eb_container: $type" {
             r flushdb

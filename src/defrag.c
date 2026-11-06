@@ -21,6 +21,7 @@
 #include "server.h"
 #include "zset_btree.h"
 #include "bitroar.h"
+#include "streamfilter.h"
 #include <stddef.h>
 #include <math.h>
 
@@ -1116,6 +1117,11 @@ void* defragStreamConsumerGroup(raxIterator *ri, void *privdata) {
         /* Update consumers back-pointer to new stream */
         cg->consumers->alloc_size = &s->alloc_size;
         defragRadixTree(&cg->consumers, 0, defragStreamConsumer, s);
+    }
+    if (cg->filter) {
+        streamFilter *newf = streamFilterDefrag(cg->filter, activeDefragAlloc);
+        if (newf)
+            cg->filter = newf;
     }
     return cg;
 }
