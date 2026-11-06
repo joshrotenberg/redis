@@ -142,6 +142,44 @@ start_server {
         assert_equal {1-7 1-9} [filter_ids [r XREADGROUP GROUP odd c COUNT 2 STREAMS s >]]
     }
 
+    test {XREADGROUP MAXSIZE on a filtered group: a match left out of the reply comes in the next read} {
+        r DEL s
+        for {set j 1} {$j <= 20} {incr j} {
+            r XADD s 1-$j parity [expr {$j % 2}] body [string repeat x 200]
+        }
+        r XGROUP CREATE s odd 0 FILTER {parity = 1}
+        # Every entry is larger than MAXSIZE, so each read returns one.
+        assert_equal {1-1} [filter_ids [r XREADGROUP GROUP odd c MAXSIZE 100 STREAMS s >]]
+        # The read stopped before 1-2: the cursor has not passed it.
+        assert_equal 1-1 [dict get [filter_group s odd] last-delivered-id]
+        set got {1-1}
+        for {set j 0} {$j < 20} {incr j} {
+            set ids [filter_ids [r XREADGROUP GROUP odd c MAXSIZE 100 STREAMS s >]]
+            if {$ids eq {}} break
+            assert_equal 1 [llength $ids]
+            lappend got {*}$ids
+        }
+        assert_equal {1-1 1-3 1-5 1-7 1-9 1-11 1-13 1-15 1-17 1-19} $got
+        assert_equal 10 [lindex [r XPENDING s odd] 0]
+        assert_equal 1-20 [dict get [filter_group s odd] last-delivered-id]
+        assert_equal 20 [dict get [filter_group s odd] entries-read]
+    }
+
+    test {XREADGROUP MAXSIZE: a filtered stream after the budget is spent is not examined} {
+        r DEL a{t} b{t}
+        r XADD a{t} 1-1 body [string repeat x 200]
+        r XADD b{t} 1-1 type bond
+        r XADD b{t} 1-2 type fx
+        r XGROUP CREATE a{t} g 0
+        r XGROUP CREATE b{t} g 0 FILTER {type = fx}
+        set res [r XREADGROUP GROUP g c MAXSIZE 100 STREAMS a{t} b{t} > >]
+        assert_equal {a{t}} [lmap e $res {lindex $e 0}]
+        assert_equal 0-0 [dict get [filter_group b{t} g] last-delivered-id]
+        set res [r XREADGROUP GROUP g c MAXSIZE 100 STREAMS a{t} b{t} > >]
+        assert_equal {{b{t} {{1-2 {type fx}}}}} $res
+        assert_equal 1-2 [dict get [filter_group b{t} g] last-delivered-id]
+    }
+
     test {Filters work across listpack nodes} {
         r DEL s
         r CONFIG SET stream-node-max-entries 7
