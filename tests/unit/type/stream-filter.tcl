@@ -487,6 +487,28 @@ start_server {
         $rd close
     }
 
+    test {RESTORE refuses a stream with two ELSE groups} {
+        r DEL s
+        r XADD s 1-1 x 1
+        r XGROUP CREATE s a 0 ELSE
+        r XGROUP CREATE s b 0 FILTER {x = 1}
+        set dump [r DUMP s]
+        # Turn group b's filter, kind 1 and its expression, into kind 2 (ELSE).
+        set at [string first "\x01\x05x = 1" $dump]
+        assert {$at > 0}
+        set bad [string replace $dump $at [expr {$at + 6}] "\x02"]
+        set saved [lindex [r CONFIG GET sanitize-dump-payload] 1]
+        r DEBUG SET-SKIP-CHECKSUM-VALIDATION 1
+        foreach sanitize {no yes} {
+            r CONFIG SET sanitize-dump-payload $sanitize
+            catch {r RESTORE s2 0 $bad} err
+            assert_match {*Bad data format*} $err
+        }
+        r CONFIG SET sanitize-dump-payload $saved
+        r DEBUG SET-SKIP-CHECKSUM-VALIDATION 0
+        assert_equal 0 [r EXISTS s2]
+    } {} {needs:debug}
+
     test {A blocked filtered read checks every entry added at once, across listpack nodes} {
         r DEL s
         set node_max [lindex [r CONFIG GET stream-node-max-entries] 1]

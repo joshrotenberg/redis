@@ -4570,6 +4570,12 @@ robj *rdbLoadObject(int rdbtype, rio *rdb, sds key, int dbid, int rdbver, int *e
                         return NULL;
                     }
                 } else if (kind == 2) {
+                    /* XGROUP refuses a second ELSE group; so does loading. */
+                    if (streamLookupElseCG(s, NULL)) {
+                        rdbReportCorruptRDB("Stream has more than one ELSE cgroup");
+                        decrRefCount(o);
+                        return NULL;
+                    }
                     filter = streamFilterCreateElse();
                 }
                 uint64_t maxscan = rdbLoadLen(rdb, NULL);
