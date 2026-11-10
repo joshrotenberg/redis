@@ -1008,6 +1008,48 @@ static void nackSetDeliveryCount(streamNACK *nack, int mode, long long retrycoun
     }
 }
 
+/* Entries left the stream 's': keep what blocked readers of its filtered
+ * groups know (streamCG.wake_*) true. Every live entry in a group's checked
+ * range is counted in wake_count once, so removing one with 'id' lowers the
+ * count by one. A trim passes 'id' NULL and 'upto', the largest ID it
+ * removed; a group whose checked range starts before 'upto' forgets the
+ * range and checks its entries again. Without this, the woken read charges
+ * removed entries to its scan budget. */
+static void streamFilterWakeRemoved(stream *s, streamID *id, streamID *upto) {
+    if (!s->filter_epoch || !s->cgroups) return;
+    raxIterator ri;
+    raxStart(&ri, s->cgroups);
+    raxSeek(&ri, "^", NULL, 0);
+    while (raxNext(&ri)) {
+        streamCG *cg = ri.data;
+        if (cg->wake_count == 0) continue;
+        if (id) {
+            if (streamCompareID(id, &cg->wake_from) <= 0 ||
+                streamCompareID(id, &cg->wake_id) > 0) continue;
+            cg->wake_count--;
+            if (streamCompareID(id, &cg->wake_id) == 0) {
+                /* The range ends at an entry still in the stream: the
+                 * newest one before 'id', or nothing past wake_from. */
+                streamID start = cg->wake_from, end = *id, prev;
+                int64_t numfields;
+                cg->wake_id = cg->wake_from;
+                if (streamIncrID(&start) == C_OK && streamDecrID(&end) == C_OK &&
+                    streamCompareID(&start, &end) <= 0)
+                {
+                    streamIterator si;
+                    streamIteratorStart(&si, s, &start, &end, 1);
+                    if (streamIteratorGetID(&si, &prev, &numfields)) cg->wake_id = prev;
+                    streamIteratorStop(&si);
+                }
+            }
+        } else if (streamCompareID(upto, &cg->wake_from) > 0) {
+            cg->wake_id = cg->wake_from;
+            cg->wake_count = 0;
+        }
+    }
+    raxStop(&ri);
+}
+
 /* Trim the stream 's' according to args->trim_strategy, and return the
  * number of elements removed from the stream. The 'approx' option, if non-zero,
  * specifies that the trimming must be performed in a approximated way in
@@ -1046,6 +1088,9 @@ int64_t streamTrim(redisDb *db, stream *s, streamAddTrimArgs *args, streamID *ma
     int delete_strategy = args->delete_strategy;
 
     if (max_deleted_id) *max_deleted_id = (streamID){0,0};
+    /* The largest ID removed, for streamFilterWakeRemoved(). */
+    int track_removed = s->filter_epoch && s->cgroups;
+    streamID removed_upto = {0,0};
 
     if (trim_strategy == TRIM_STRATEGY_NONE)
         return 0;
@@ -1090,10 +1135,11 @@ int64_t streamTrim(redisDb *db, stream *s, streamAddTrimArgs *args, streamID *ma
         }
 
         if (remove_node) {
-            if (max_deleted_id) {
+            if (max_deleted_id || track_removed) {
                 if (trim_strategy == TRIM_STRATEGY_MAXLEN)
                     lpGetEdgeStreamID(lp, 0, &master_id, &last_id);
-                *max_deleted_id = last_id;
+                if (max_deleted_id) *max_deleted_id = last_id;
+                removed_upto = last_id;
             }
             s->alloc_size -= lpBytes(lp);
             lpFree(lp);
@@ -1188,6 +1234,7 @@ int64_t streamTrim(redisDb *db, stream *s, streamAddTrimArgs *args, streamID *ma
                     flags |= STREAM_ITEM_FLAG_DELETED;
                     lp = lpReplaceInteger(lp, &pcopy, flags);
                     if (max_deleted_id) *max_deleted_id = currid;
+                    removed_upto = currid;
                     deleted_from_lp++;
                     s->length--;
                     if (p) p = lpNext(lp, pcopy) + delta;
@@ -1243,6 +1290,7 @@ int64_t streamTrim(redisDb *db, stream *s, streamAddTrimArgs *args, streamID *ma
     } else if (deleted) {
         streamGetEdgeID(s,1,1,&s->first_id);
     }
+    if (deleted && track_removed) streamFilterWakeRemoved(s, NULL, &removed_upto);
 
     return deleted;
 }
@@ -1812,6 +1860,7 @@ void streamIteratorRemoveEntry(streamIterator *si, streamID *current) {
 
     /* Update the number of entries counter. */
     s->length--;
+    streamFilterWakeRemoved(s, current, NULL);
 
     /* Re-seek the iterator to fix the now messed up state. */
     streamID start, end;
@@ -2469,13 +2518,23 @@ static int streamCGMatchEntry(stream *s, streamCG *cg, streamIterator *si, int64
 static int streamCGAdvanceBy(stream *s, streamCG *group, streamID *id, long long n) {
     if (streamCompareID(id, &group->last_id) <= 0) return 0;
     if (group->entries_read != SCG_INVALID_ENTRIES_READ &&
+        s->length &&
         streamCompareID(&group->last_id, &s->first_id) >= 0 &&
         !streamRangeHasTombstones(s, &group->last_id, NULL))
     {
         /* A valid counter and no tombstones between the group's last-delivered-id
          * and the stream's last-generated-id mean we can increment the read counter
-         * to keep tracking the group's progress. */
+         * to keep tracking the group's progress. An empty stream reports no
+         * tombstones, though the entries passed may all have been deleted. */
         group->entries_read += n;
+    } else if (n > 1 && streamCompareID(&group->last_id, &s->first_id) < 0 &&
+               !streamRangeHasTombstones(s, &s->first_id, NULL))
+    {
+        /* The group is behind the stream's first entry, so the 'n' entries
+         * start there, where the counter is known, and end at 'id'. The
+         * estimate for 'id' itself is exact only at the stream's edges. */
+        long long first = streamEstimateDistanceFromFirstEverEntry(s, &s->first_id);
+        group->entries_read = first == SCG_INVALID_ENTRIES_READ ? first : first + n - 1;
     } else if (s->entries_added) {
         /* The group's counter may be invalid, so we try to obtain it. */
         group->entries_read = streamEstimateDistanceFromFirstEverEntry(s, id);
@@ -2509,6 +2568,7 @@ static int streamFilterSkip(stream *s, streamCG *group, long long budget, long l
     if (group->wake_epoch == s->filter_epoch &&
         streamCompareID(&group->wake_from, &group->last_id) == 0 &&
         streamCompareID(&group->wake_id, &group->last_id) > 0 &&
+        streamCompareID(&group->wake_id, &s->last_id) <= 0 &&
         group->wake_count <= budget)
     {
         streamCGAdvanceBy(s, group, &group->wake_id, group->wake_count);
@@ -2546,8 +2606,11 @@ static int streamFilterSkip(stream *s, streamCG *group, long long budget, long l
  * read backward from the end of the stream: a forward iterator would decode
  * every entry of the last node before reaching them. */
 static int streamFilterWakeCheck(stream *s, streamCG *cg, long long budget) {
+    /* XSETID can lower the stream's last ID below what was checked, and new
+     * entries then land inside the checked range. */
     if (cg->wake_epoch != s->filter_epoch ||
-        streamCompareID(&cg->wake_from, &cg->last_id) != 0)
+        streamCompareID(&cg->wake_from, &cg->last_id) != 0 ||
+        streamCompareID(&cg->wake_id, &s->last_id) > 0)
     {
         cg->wake_from = cg->last_id;
         cg->wake_id = cg->last_id;
@@ -2558,7 +2621,7 @@ static int streamFilterWakeCheck(stream *s, streamCG *cg, long long budget) {
     if (streamCompareID(&cg->wake_id, &s->last_id) >= 0) return 0;
 
     streamIterator si;
-    streamID start = cg->wake_id, id;
+    streamID start = cg->wake_id, id, newest = cg->wake_id;
     int64_t numfields;
     long long fresh = 0;
     int wake = 0;
@@ -2571,13 +2634,21 @@ static int streamFilterWakeCheck(stream *s, streamCG *cg, long long budget) {
             break;
         }
         streamIteratorSkipFields(&si, numfields);
-        fresh++;
+        if (fresh == 0) newest = id;
+        /* More entries than the budget: the read will be served whatever the
+         * rest hold, so stop here rather than read back to the cursor. */
+        if (cg->wake_count + ++fresh > budget) {
+            wake = 1;
+            break;
+        }
     }
     streamIteratorStop(&si);
-    if (!wake && cg->wake_count + fresh > budget) wake = 1;
     if (!wake) {
-        /* Every entry up to the stream's last ID is now checked. */
-        cg->wake_id = s->last_id;
+        /* Every entry up to the stream's last ID is now checked. The range
+         * ends at the newest of them, not at the last ID, which can be a
+         * deleted entry's or one XSETID set: a woken read moves the cursor
+         * to the range's end, and so stops where a scan would. */
+        cg->wake_id = newest;
         cg->wake_count += fresh;
     }
     return wake;
@@ -3678,8 +3749,11 @@ void xreadCommand(client *c) {
                                            group->maxscan ? group->maxscan :
                                            server.stream_filter_max_scan;
                         long long examined;
+                        streamID before = group->last_id;
                         int res = streamFilterSkip(s, group, budget, &examined);
-                        if (examined) {
+                        /* Not 'examined': the cursor can also move past
+                         * checked entries that were deleted since. */
+                        if (streamCompareID(&group->last_id, &before) != 0) {
                             streamPropagateGroupID(c, spi.keyname, group, spi.groupname);
                             server.dirty++;
                             keyModified(c,c->db,c->argv[streams_arg+i],o,0); /* only update LRM */
@@ -4495,6 +4569,7 @@ NULL
         if (maxscan >= 0) cg->maxscan = maxscan;
         if (server.memory_tracking_enabled)
             updateSlotAllocSize(c->db,getKeySlot(c->argv[2]->ptr),o,old_alloc,kvobjAllocSize(o));
+        streamStatsReenterStructural(c->db, s, cg);
         addReply(c,shared.ok);
         server.dirty++;
         notifyKeyspaceEvent(NOTIFY_STREAM,"xgroup-setfilter",c->argv[2],c->db->id);

@@ -133,8 +133,11 @@ typedef struct streamCG {
     /* What blocked readers of a filtered group already know, so a new entry
      * the group does not take wakes none of them. Entries in
      * (wake_from, wake_id] were checked and the group takes none of them;
-     * wake_count is how many there are. Valid while last_id == wake_from and
-     * wake_epoch == stream.filter_epoch. Not persisted or replicated. */
+     * wake_id is the newest of them still in the stream (or wake_from when
+     * none is), and wake_count how many remain (removals update both, see
+     * streamFilterWakeRemoved()). Valid while last_id == wake_from,
+     * wake_id <= stream.last_id and wake_epoch == stream.filter_epoch. Not
+     * persisted or replicated. */
     streamID wake_from;
     streamID wake_id;
     long long wake_count;

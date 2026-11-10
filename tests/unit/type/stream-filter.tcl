@@ -389,7 +389,10 @@ start_server {
         assert_equal 1 [s blocked_clients]
         r XADD s 1-4 px 5
         assert_equal {{s {}}} [$rd read]
-        assert_equal 1-3 [dict get [filter_group s big] last-delivered-id]
+        # The read skipped the three from before the stream's first entry and
+        # still counts them in entries-read.
+        set g [filter_group s big]
+        assert_equal {1-3 3 1} [list [dict get $g last-delivered-id] [dict get $g entries-read] [dict get $g lag]]
         $rd close
     }
 
@@ -425,6 +428,62 @@ start_server {
         assert_equal {{s {{3-3 {px 500}}}}} [$rd read]
         set g [filter_group s big]
         assert_equal {3-3 13 0} [list [dict get $g last-delivered-id] [dict get $g entries-read] [dict get $g lag]]
+        $rd close
+    }
+
+    test {A blocked filtered read's scan budget counts only entries still in the stream} {
+        r DEL s
+        r XGROUP CREATE s big $ MKSTREAM FILTER {px > 200}
+        set rd [redis_deferring_client]
+        $rd XREADGROUP GROUP big c MAXSCAN 3 BLOCK 0 STREAMS s >
+        wait_for_blocked_clients_count 1
+        # An entry deleted after the wakeup check passed over it leaves room
+        # in the budget for one more.
+        for {set j 1} {$j <= 3} {incr j} {r XADD s 1-$j px 5}
+        r XDEL s 1-2
+        r XADD s 1-4 px 5
+        assert_equal 1 [s blocked_clients]
+        r XADD s 1-5 px 5
+        assert_equal {{s {}}} [$rd read]
+        assert_equal 1-4 [dict get [filter_group s big] last-delivered-id]
+        # So do entries trimmed after the cursor.
+        $rd XREADGROUP GROUP big c MAXSCAN 3 BLOCK 0 STREAMS s >
+        wait_for_blocked_clients_count 1
+        for {set j 1} {$j <= 3} {incr j} {r XADD s 2-$j px 5}
+        r XTRIM s MINID 2-3
+        r XADD s 2-4 px 5
+        r XADD s 2-5 px 5
+        assert_equal 1 [s blocked_clients]
+        r XADD s 2-6 px 5
+        assert_equal {{s {}}} [$rd read]
+        assert_equal 2-5 [dict get [filter_group s big] last-delivered-id]
+        # Deleting the newest checked entry: another read of the group stops
+        # at the entry before it, as a read without the wakeup check would.
+        $rd XREADGROUP GROUP big c MAXSCAN 3 BLOCK 0 STREAMS s >
+        wait_for_blocked_clients_count 1
+        r XADD s 3-1 px 5
+        r XADD s 3-2 px 5
+        r XDEL s 3-2
+        assert_equal {} [r XREADGROUP GROUP big c2 MAXSCAN 3 STREAMS s >]
+        assert_equal 3-1 [dict get [filter_group s big] last-delivered-id]
+        $rd close
+    }
+
+    test {XSETID below a blocked filtered read's checked range: a match still wakes it} {
+        r DEL s
+        r XADD s 1-0 f x
+        r XGROUP CREATE s g $ FILTER {f = z}
+        set rd [redis_deferring_client]
+        $rd XREADGROUP GROUP g a BLOCK 0 STREAMS s >
+        wait_for_blocked_clients_count 1
+        # The check SETFILTER runs covers the stream up to its last ID, 50-0;
+        # XSETID then lowers it, and the match lands below 50-0.
+        r XSETID s 50-0
+        r XGROUP SETFILTER s g {f = z}
+        r XSETID s 10-0
+        r XADD s 20-0 f z
+        assert_equal {{s {{20-0 {f z}}}}} [$rd read]
+        assert_equal 20-0 [dict get [filter_group s g] last-delivered-id]
         $rd close
     }
 
